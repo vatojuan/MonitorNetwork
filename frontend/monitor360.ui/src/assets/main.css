@@ -1,0 +1,71 @@
+/* src/assets/main.css */
+@import './base.css';
+
+/* === Reset de restricciones heredadas del template === */
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #1a1a2e; /* opcional, para empatar tu tema */
+  color: #e0e0e0; /* opcional, para empatar tu tema */
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* Quitar la columna fija y centrada */
+#app {
+  max-width: none; /* <- clave */
+  margin: 0; /* <- clave */
+  padding: 0; /* <- clave */
+  width: 100%;
+  min-height: 100vh; /* para permitir header sticky + contenido */
+  display: block; /* quitamos grid/flex del template */
+  box-sizing: border-box;
+}
+
+/* Estilos de links (si querés conservar el comportamiento) */
+a,
+.green {
+  text-decoration: none;
+  color: hsla(160, 100%, 37%, 1);
+  transition: 0.4s;
+  padding: 3px;
+}
+@media (hover: hover) {
+  a:hover {
+    background-color: hsla(160, 100%, 37%, 0.2);
+  }
+}
+
+/* Anulamos el media query del template que centraba todo */
+@media (min-width: 1024px) {
+  body {
+    display: block; /* <- Antes: display:flex; place-items:center; */
+    place-items: initial;
+  }
+
+  #app {
+    display: block; /* <- Antes: display:grid; */
+    grid-template-columns: initial;
+    padding: 0; /* nada de padding global aquí */
+  }
+}
+
+/* (Opcional) helpers para layout ancho completo en tus vistas */
+.full-width {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.container-max {
+  /* si querés un contenedor centrado SOLO en lugares puntuales */
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 0 2rem;
+  box-sizing: border-box;
+}

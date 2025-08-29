@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Monitor360 - Logo Ultra Futurista
+    - Glow doble (halo teal + halo cyan)
+    - Bordes gruesos
+    - Totalmente transparente (sin fondo)
+  -->
+
+  <defs>
+    <!-- Gradiente principal teal → cyan -->
+    <linearGradient id="grad-teal" x1="128" y1="96" x2="384" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00c896"/>
+      <stop offset="100%" stop-color="#23d7ff"/>
+    </linearGradient>
+
+    <!-- Glow interior (teal) -->
+    <filter id="glow-teal" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="16" result="blur1"/>
+      <feMerge>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Glow exterior (cyan más extendido) -->
+    <filter id="glow-cyan" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="30" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Sombra adicional -->
+    <filter id="soft-drop" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#00c896" flood-opacity="0.3"/>
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- === Contenedor tipo app (doble halo) === -->
+  <g filter="url(#soft-drop)">
+    <rect x="76" y="76" width="360" height="360" rx="88"
+          fill="none"
+          stroke="url(#grad-teal)" stroke-width="26"
+          filter="url(#glow-cyan)"/>
+  </g>
+
+  <!-- === Aro velocímetro con doble glow === -->
+  <circle cx="256" cy="256" r="116"
+          fill="none"
+          stroke="url(#grad-teal)" stroke-width="26"
+          filter="url(#glow-cyan)"/>
+
+  <!-- Aguja con glow teal -->
+  <path d="M256 256 L340 208"
+        stroke="url(#grad-teal)" stroke-width="28" stroke-linecap="round"
+        filter="url(#glow-teal)"/>
+
+  <!-- Núcleo con doble halo -->
+  <circle cx="256" cy="256" r="24"
+          fill="url(#grad-teal)"
+          filter="url(#glow-cyan)"/>
+</svg>

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="grad-teal" x1="128" y1="96" x2="384" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00c896"/>
+      <stop offset="100%" stop-color="#23d7ff"/>
+    </linearGradient>
+    <filter id="outer-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Panel cuadrado redondeado -->
+  <rect x="76" y="76" width="360" height="360" rx="88"
+        fill="none" stroke="url(#grad-teal)" stroke-width="18"
+        filter="url(#outer-glow)" />
+
+  <!-- Círculo -->
+  <circle cx="256" cy="256" r="120"
+          fill="none" stroke="url(#grad-teal)" stroke-width="18"
+          filter="url(#outer-glow)" />
+
+  <!-- Aguja -->
+  <path d="M256 256 L 330 210"
+        stroke="url(#grad-teal)" stroke-width="20" stroke-linecap="round"
+        filter="url(#outer-glow)" />
+
+  <!-- Núcleo -->
+  <circle cx="256" cy="256" r="18" fill="url(#grad-teal)" filter="url(#outer-glow)" />
+</svg>

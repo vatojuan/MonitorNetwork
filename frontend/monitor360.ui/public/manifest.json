@@ -1,0 +1,33 @@
+{
+  "name": "Monitor360",
+  "short_name": "Monitor360",
+  "description": "Plataforma de monitoreo profesional centralizada y multi-métrica.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#00c896",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon_32x32.png",
+      "sizes": "32x32",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon_64x64.png",
+      "sizes": "64x64",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon_128x128.png",
+      "sizes": "128x128",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon_512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

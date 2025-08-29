@@ -1,0 +1,22 @@
+# Entorno virtual de Python
+venv/
+
+# Archivos de caché de Python
+__pycache__/
+*.pyc
+
+# Base de datos SQLite y otros datos volátiles
+# La carpeta 'data' se creará, pero su contenido será ignorado.
+/backend/data/*
+!/backend/data/.gitkeep
+
+# Archivos del editor (ej. VSCode)
+.vscode/
+
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
+
+# Si tuvieras un frontend con Node.js, añadirías esto:
+# /frontend/node_modules/
+# /frontend/dist/

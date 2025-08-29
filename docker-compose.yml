@@ -1,0 +1,39 @@
+services:
+  monitor360-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: monitor360-backend
+    ports:
+      - "8000:8000"
+
+    # Habilitamos privilegios para permitir que wg-quick aplique sysctl desde dentro
+    privileged: true
+
+    # (opcional mantener) capacidades explícitas y TUN
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    # Seteamos estos sysctls al arrancar (wg-quick también los tocará, pero ya no fallará)
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.disable_ipv6: "1"
+
+    environment:
+      # Userspace WG para Docker Desktop / hosts sin módulo WG
+      - WG_QUICK_USERSPACE_IMPLEMENTATION=boringtun
+      # Bloquea cualquier intento de tocar resolv.conf (aunque tu perfil ya no tiene DNS=)
+      - WG_QUICK_DNS=off
+
+    security_opt:
+      - no-new-privileges:true
+
+    # Persistencia de la base SQLite fuera del contenedor
+    volumes:
+      - ./backend/data:/app/data:rw
+      - /etc/localtime:/etc/localtime:ro
+
+    restart: unless-stopped
