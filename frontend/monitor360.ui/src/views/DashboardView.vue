@@ -28,6 +28,23 @@ const sensorDetailsToShow = ref(null)
 let socket = null
 let wsRetryTimer = null
 
+// --- Canales (para mostrar nombre en alertas) ---
+const channelsById = ref({})
+
+async function ensureChannelsLoaded() {
+  if (Object.keys(channelsById.value).length) return
+  try {
+    const { data } = await http.get('/api/channels')
+    const map = {}
+    ;(Array.isArray(data) ? data : []).forEach((c) => {
+      map[c.id] = c
+    })
+    channelsById.value = map
+  } catch (e) {
+    console.error('Error cargando canales:', e)
+  }
+}
+
 // --- FUNCIÓN HELPER PARA FORMATEAR TRÁFICO ---
 function formatBitrate(bits) {
   const n = Number(bits)
@@ -36,6 +53,39 @@ function formatBitrate(bits) {
   if (kbps < 1000) return `${kbps.toFixed(1)} Kbps`
   const mbps = kbps / 1000
   return `${mbps.toFixed(1)} Mbps`
+}
+
+// --- Helpers de visualización (modal) ---
+function toDisplay(v) {
+  try {
+    if (v == null) return '—'
+    if (typeof v === 'object') return JSON.stringify(v, null, 2)
+    return String(v)
+  } catch {
+    return String(v)
+  }
+}
+function isMultilineValue(v) {
+  if (v == null) return false
+  if (typeof v === 'object') return true
+  const s = String(v)
+  const t = s.trim()
+  return t.includes('\n') || t.length > 80 || t.startsWith('{') || t.startsWith('[')
+}
+
+function alertTypeLabel(t) {
+  switch (t) {
+    case 'timeout':
+      return 'Timeout'
+    case 'high_latency':
+      return 'Latencia alta'
+    case 'speed_change':
+      return 'Cambio de velocidad'
+    case 'traffic_threshold':
+      return 'Umbral de tráfico'
+    default:
+      return t || '—'
+  }
 }
 
 // --- WebSocket con reconexión y URL dinámica ---
@@ -73,7 +123,6 @@ function connectWebSocket() {
 
   socket.onerror = (error) => {
     console.error('Error de WebSocket:', error)
-    // Cierre “seguro” sin try/catch vacío
     if (
       socket &&
       socket.readyState !== WebSocket.CLOSING &&
@@ -156,15 +205,29 @@ function goToSensorDetail(sensorId) {
   router.push(`/sensor/${sensorId}`)
 }
 
-function showSensorDetails(sensor, event) {
+async function showSensorDetails(sensor, event) {
   if (event?.stopPropagation) event.stopPropagation()
+  await ensureChannelsLoaded()
   sensorDetailsToShow.value = sensor
 }
 
-// Formatea la configuración para mostrarla en el modal
+// --------- Datos para el modal ---------
+const normalizedConfig = computed(() => {
+  if (!sensorDetailsToShow.value) return {}
+  const cfg = sensorDetailsToShow.value.config
+  if (cfg && typeof cfg === 'string') {
+    try {
+      return JSON.parse(cfg)
+    } catch {
+      return {}
+    }
+  }
+  return cfg || {}
+})
+
+// Campos (no-alertas) como lista de pares
 const formattedSensorConfig = computed(() => {
-  if (!sensorDetailsToShow.value) return []
-  const config = sensorDetailsToShow.value.config || {}
+  const config = normalizedConfig.value
   const details = []
   for (const key in config) {
     if (Object.prototype.hasOwnProperty.call(config, key) && key !== 'alerts') {
@@ -172,9 +235,43 @@ const formattedSensorConfig = computed(() => {
     }
   }
   if (Array.isArray(config.alerts) && config.alerts.length > 0) {
-    details.push({ key: 'Alertas Configuradas', value: config.alerts.length })
+    details.push({ key: 'Alertas configuradas', value: `${config.alerts.length}` })
   }
   return details
+})
+
+// Alertas “bonitas”
+const alertsForModal = computed(() => {
+  const config = normalizedConfig.value
+  const arr = Array.isArray(config?.alerts) ? config.alerts : []
+  return arr.map((a, idx) => {
+    const type = a?.type
+    let umbral = '—'
+    let direccion = '—'
+    if (type === 'high_latency') {
+      umbral = a?.threshold_ms != null ? `${a.threshold_ms} ms` : '—'
+    }
+    if (type === 'traffic_threshold') {
+      if (a?.threshold_mbps != null) umbral = `${a.threshold_mbps} Mbps`
+      if (a?.direction) direccion = a.direction
+    }
+    const cooldown = a?.cooldown_minutes != null ? `${a.cooldown_minutes} min` : '5 min'
+    const channel =
+      a?.channel_id != null && channelsById.value[a.channel_id]?.name
+        ? channelsById.value[a.channel_id].name
+        : a?.channel_id != null
+          ? `Canal #${a.channel_id}`
+          : '—'
+
+    return {
+      id: idx,
+      typeLabel: alertTypeLabel(type),
+      umbral,
+      direccion,
+      channel,
+      cooldown,
+    }
+  })
 })
 </script>
 
@@ -200,14 +297,45 @@ const formattedSensorConfig = computed(() => {
     <div v-if="sensorDetailsToShow" class="modal-overlay" @click.self="sensorDetailsToShow = null">
       <div class="modal-content">
         <h3>Detalles del Sensor: {{ sensorDetailsToShow.name }}</h3>
+
         <table class="details-table">
           <tbody>
             <tr v-for="item in formattedSensorConfig" :key="item.key">
               <th>{{ item.key }}</th>
-              <td>{{ item.value }}</td>
+              <td>
+                <pre v-if="isMultilineValue(item.value)" class="value-pre">{{
+                  toDisplay(item.value)
+                }}</pre>
+                <span v-else>{{ toDisplay(item.value) }}</span>
+              </td>
             </tr>
           </tbody>
         </table>
+
+        <div v-if="alertsForModal.length" class="alerts-section">
+          <h4>Alertas configuradas</h4>
+          <table class="alerts-table">
+            <thead>
+              <tr>
+                <th>Tipo</th>
+                <th>Umbral</th>
+                <th>Dirección</th>
+                <th>Canal</th>
+                <th>Cooldown</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in alertsForModal" :key="row.id">
+                <td>{{ row.typeLabel }}</td>
+                <td>{{ row.umbral }}</td>
+                <td>{{ row.direccion }}</td>
+                <td>{{ row.channel }}</td>
+                <td>{{ row.cooldown }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
         <div class="modal-actions">
           <button @click="sensorDetailsToShow = null" class="btn-secondary">Cerrar</button>
         </div>
@@ -256,11 +384,12 @@ const formattedSensorConfig = computed(() => {
                   :class="getStatusClass(liveSensorStatus[sensor.id]?.status)"
                 >
                   <template v-if="sensor.sensor_type === 'ping'">
-                    {{
-                      liveSensorStatus[sensor.id]?.status === 'pending'
-                        ? '...'
-                        : `${liveSensorStatus[sensor.id]?.latency_ms ?? '—'} ms`
-                    }}
+                    <span v-if="liveSensorStatus[sensor.id]?.status === 'timeout'">Timeout</span>
+                    <span v-else-if="liveSensorStatus[sensor.id]?.status === 'error'">Error</span>
+                    <span v-else-if="liveSensorStatus[sensor.id]?.status === 'pending'">...</span>
+                    <span v-else>{{
+                      (liveSensorStatus[sensor.id]?.latency_ms ?? '—') + ' ms'
+                    }}</span>
                   </template>
 
                   <template v-else-if="sensor.sensor_type === 'ethernet'">
@@ -431,6 +560,8 @@ const formattedSensorConfig = computed(() => {
   text-align: center;
   padding: 1rem;
 }
+
+/* ===== Modal ===== */
 .modal-overlay {
   position: fixed;
   top: 0;
@@ -447,13 +578,17 @@ const formattedSensorConfig = computed(() => {
   background-color: var(--surface-color);
   padding: 2rem;
   border-radius: 12px;
-  max-width: 500px;
-  width: 90%;
-  text-align: center;
+  max-width: 700px;
+  width: 92%;
+  text-align: left;
+
+  /* Evita que el contenido explote la pantalla */
+  max-height: 80vh;
+  overflow: auto;
 }
 .modal-actions {
   display: flex;
-  justify-content: center;
+  justify-content: flex-end;
   gap: 1rem;
   margin-top: 1.5rem;
 }
@@ -473,6 +608,68 @@ const formattedSensorConfig = computed(() => {
   color: white;
 }
 
+/* ===== Tabla de detalles (config general) ===== */
+.details-table {
+  width: 100%;
+  text-align: left;
+  margin-top: 1rem;
+  border-collapse: collapse;
+}
+.details-table th,
+.details-table td {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--primary-color);
+  vertical-align: top;
+}
+.details-table th {
+  color: var(--gray);
+  text-transform: capitalize;
+  width: 220px;
+}
+.details-table td {
+  color: white;
+  white-space: normal;
+  word-break: break-word; /* mejor que break-all */
+}
+.value-pre {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  white-space: pre-wrap; /* respeta saltos de línea */
+  word-break: normal;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
+    monospace;
+  font-size: 0.9rem;
+  line-height: 1.25rem;
+  margin: 0;
+}
+
+/* ===== Tabla de alertas “bonita” ===== */
+.alerts-section {
+  margin-top: 1.25rem;
+}
+.alerts-section h4 {
+  margin: 0 0 0.5rem 0;
+}
+.alerts-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.alerts-table th,
+.alerts-table td {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--primary-color);
+}
+.alerts-table th {
+  color: var(--gray);
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.alerts-table td {
+  color: white;
+}
 .sensor-status-group {
   display: flex;
   align-items: center;
@@ -493,24 +690,5 @@ const formattedSensorConfig = computed(() => {
 }
 .details-btn:hover {
   background-color: rgba(255, 255, 255, 0.1);
-}
-.details-table {
-  width: 100%;
-  text-align: left;
-  margin-top: 1rem;
-  border-collapse: collapse;
-}
-.details-table th,
-.details-table td {
-  padding: 0.75rem;
-  border-bottom: 1px solid var(--primary-color);
-}
-.details-table th {
-  color: var(--gray);
-  text-transform: capitalize;
-}
-.details-table td {
-  color: white;
-  word-break: break-all;
 }
 </style>

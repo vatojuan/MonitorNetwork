@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import axios from 'axios'
 import { Line } from 'vue-chartjs'
@@ -16,9 +16,9 @@ import {
 } from 'chart.js'
 import 'chartjs-adapter-date-fns'
 import { es } from 'date-fns/locale'
-import { format } from 'date-fns'
 import zoomPlugin from 'chartjs-plugin-zoom'
 
+// Registrar componentes/escala/plugins de Chart.js (incluye zoom)
 ChartJS.register(
   Title,
   Tooltip,
@@ -31,242 +31,126 @@ ChartJS.register(
   zoomPlugin,
 )
 
-// --- Endpoints dinámicos ---
+// ---------- Endpoints dinámicos ----------
 const API_PROTO = window.location.protocol
 const HOST = window.location.hostname
 const API_BASE_URL = `${API_PROTO}//${HOST}:8000/api`
 const WS_PROTO = API_PROTO === 'https:' ? 'wss' : 'ws'
 const WS_URL = `${WS_PROTO}://${HOST}:8000/ws`
 
+// ---------- Router / estado base ----------
 const route = useRoute()
 const router = useRouter()
-
-// --- Estado ---
 const chartRef = ref(null)
-const chartKey = ref(0) // Re-render sólo cuando cambiamos rango/cargamos historia
+
 const sensorId = Number(route.params.id)
 const sensorInfo = ref(null)
 const historyData = ref([])
+const knownTimestamps = ref(new Set())
 const isLoading = ref(true)
 const isZoomed = ref(false)
 const timeRange = ref('24h')
-const viewEndDate = ref(new Date())
-const liveMode = ref(true)
+const isLiveView = ref(true) // si estamos pegados al presente
 
+const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+
+// ---------- WebSocket ----------
 let socket = null
-let wsReconnectTimer = null
-let wsAttempts = 0
-let liveTickTimer = null
 
-// --- Helpers ---
-function formatBitrateForChart(bits) {
-  const n = Number(bits)
-  if (!Number.isFinite(n) || n < 0) return 0
-  return Number((n / 1_000_000).toFixed(2))
-}
-
-/**
- * Normaliza timestamps del backend.
- * - Con zona (Z / +hh:mm): se respeta tal cual (el navegador lo muestra en local).
- * - Sin zona (p.ej. "YYYY-MM-DD HH:mm:ss" de SQLite): se interpreta como HORA LOCAL (NO UTC).
- *   Esto evita el corrimiento de -3h que veías.
- */
-// Reemplaza la función parseApiTs por esta versión
-function parseApiTs(ts) {
-  if (!ts) return new Date()
-  if (ts instanceof Date) return ts
-  if (typeof ts === 'number') return new Date(ts)
-
-  if (typeof ts === 'string') {
-    // 1) Si viene con zona (Z o +hh:mm), el navegador ya la convierte a local.
-    if (/T.*([+-]\d{2}:\d{2}|Z)$/i.test(ts)) {
-      return new Date(ts)
-    }
-    // 2) SQLite: "YYYY-MM-DD HH:mm:ss" (UTC pero sin zona) -> trátalo como UTC agregando 'Z'
-    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(ts)) {
-      return new Date(ts.replace(' ', 'T') + 'Z')
-    }
-    // 3) "YYYY-MM-DDTHH:mm:ss" (sin zona) -> asúmelo UTC
-    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(ts)) {
-      return new Date(ts + 'Z')
-    }
-    // Fallback
-    return new Date(ts)
-  }
-
-  return new Date(ts)
-}
-
-const timeRanges = { '1h': 1, '12h': 12, '24h': 24, '7d': 168, '30d': 720 }
-
-const viewStartDate = computed(() => {
-  const endDate = new Date(viewEndDate.value)
-  endDate.setHours(endDate.getHours() - timeRanges[timeRange.value])
-  return endDate
-})
-
-const isEthernet = computed(() => sensorInfo.value?.sensor_type === 'ethernet')
-const isPing = computed(() => sensorInfo.value?.sensor_type === 'ping')
-
-// Ventana viva (seguir al "ahora")
-const isLiveWindow = computed(() => {
-  const diff = Date.now() - viewEndDate.value.getTime()
-  return liveMode.value && diff < 60_000
-})
-
-function trimHistoryToWindow() {
-  const start = viewStartDate.value.getTime()
-  const end = viewEndDate.value.getTime()
-  historyData.value = historyData.value.filter((d) => {
-    const t = d.timestamp.getTime()
-    return t >= start && t <= end
-  })
-}
-
-// --- Carga inicial ---
-async function fetchSensorInfo() {
-  try {
-    const { data } = await axios.get(`${API_BASE_URL}/sensors/${sensorId}/details`)
-    sensorInfo.value = data
-  } catch (err) {
-    console.error('Error fetching sensor info:', err)
-    router.push('/')
-  }
-}
-
-async function fetchHistory() {
-  isLoading.value = true
-  try {
-    const startISO = viewStartDate.value.toISOString()
-    const endISO = viewEndDate.value.toISOString()
-    const { data } = await axios.get(`${API_BASE_URL}/sensors/${sensorId}/history_range`, {
-      params: { start: startISO, end: endISO },
-    })
-
-    const arr = Array.isArray(data) ? data : []
-    arr.sort((a, b) => parseApiTs(a.timestamp) - parseApiTs(b.timestamp))
-    historyData.value = arr.map((row) => {
-      const base = { timestamp: parseApiTs(row.timestamp) }
-      if (row.latency_ms !== undefined) {
-        base.latency_ms = Number(row.latency_ms) || 0
-        base.status = row.status || 'ok'
-      }
-      if (row.rx_bitrate !== undefined || row.tx_bitrate !== undefined) {
-        base.status = row.status || 'link_down'
-        base.speed = row.speed || 'N/A'
-        base.rx_bitrate = row.rx_bitrate ?? '0'
-        base.tx_bitrate = row.tx_bitrate ?? '0'
-      }
-      return base
-    })
-  } catch (err) {
-    console.error('Error fetching history:', err)
-    historyData.value = []
-  } finally {
-    isLoading.value = false
-  }
-}
-
-// --- WS tiempo real ---
 function connectWebSocket() {
   try {
     socket = new WebSocket(WS_URL)
-
-    socket.onopen = () => {
-      wsAttempts = 0
-    }
 
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
         if (Number(data.sensor_id) !== sensorId) return
 
-        const ts = parseApiTs(data.timestamp)
-        const last = historyData.value[historyData.value.length - 1]
-        if (last && ts <= last.timestamp) return
+        // Si estamos en vista "en vivo", agregamos el punto nuevo.
+        if (isLiveView.value) {
+          const key = new Date(data.timestamp).toISOString()
+          if (!knownTimestamps.value.has(key)) {
+            knownTimestamps.value.add(key)
+            historyData.value.push(data)
 
-        if (data.sensor_type === 'ping') {
-          historyData.value.push({
-            timestamp: ts,
-            latency_ms: Number(data.latency_ms) || 0,
-            status: data.status || 'ok',
-          })
-        } else if (data.sensor_type === 'ethernet') {
-          historyData.value.push({
-            timestamp: ts,
-            status: data.status || 'link_down',
-            speed: data.speed || 'N/A',
-            rx_bitrate: data.rx_bitrate ?? '0',
-            tx_bitrate: data.tx_bitrate ?? '0',
-          })
+            // Asegurar orden temporal si viniera fuera de orden
+            const len = historyData.value.length
+            if (len > 1) {
+              const last = new Date(historyData.value[len - 1].timestamp)
+              const prev = new Date(historyData.value[len - 2].timestamp)
+              if (last < prev) {
+                historyData.value.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+              }
+            }
+          }
         }
-
-        if (isLiveWindow.value) {
-          viewEndDate.value = new Date()
-          trimHistoryToWindow()
-        }
-
-        updateChartFromState()
       } catch (err) {
-        console.error('WS parse error:', err)
+        // Evitamos no-empty y registramos en dev
+        if (import.meta.env?.DEV) console.debug('WS parse error:', err)
       }
-    }
-
-    socket.onclose = () => {
-      const delay = Math.min(30000, 1000 * 2 ** wsAttempts)
-      wsAttempts += 1
-      if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
-      wsReconnectTimer = setTimeout(connectWebSocket, delay)
     }
 
     socket.onerror = (err) => {
-      console.error('WebSocket error:', err)
-      if (socket && socket.readyState !== WebSocket.CLOSED) {
-        socket.close()
-      }
+      if (import.meta.env?.DEV) console.debug('WebSocket error:', err)
+    }
+
+    socket.onclose = () => {
+      // Reintento simple
+      setTimeout(connectWebSocket, 3000)
     }
   } catch (err) {
-    console.error('No se pudo abrir WebSocket:', err)
+    if (import.meta.env?.DEV) console.debug('No se pudo abrir WebSocket:', err)
   }
 }
 
-// Mantener vivo el rango cuando liveMode está activo
-function startLiveTick() {
-  if (liveTickTimer) clearInterval(liveTickTimer)
-  liveTickTimer = setInterval(() => {
-    if (!isLiveWindow.value) return
-    viewEndDate.value = new Date()
-    trimHistoryToWindow()
-    updateChartFromState()
-  }, 5000)
+// ---------- Helpers ----------
+function formatBitrateForChart(bits) {
+  const n = Number(bits)
+  if (!Number.isFinite(n) || n < 0) return 0
+  return Number((n / 1_000_000).toFixed(2)) // Mbps
 }
 
-// --- Interacciones de rango ---
+const timeRanges = { '1h': 1, '12h': 12, '24h': 24, '7d': 168, '30d': 720 }
+
+// ---------- Carga inicial de historial y sensor ----------
+async function fetchHistory() {
+  isLoading.value = true
+  try {
+    // El back calcula start/end en UTC según time_range
+    const { data } = await axios.get(`${API_BASE_URL}/sensors/${sensorId}/history_range`, {
+      params: { time_range: timeRange.value },
+    })
+    const arr = Array.isArray(data) ? data : []
+    arr.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+    historyData.value = arr
+    knownTimestamps.value = new Set(arr.map((d) => new Date(d.timestamp).toISOString()))
+  } catch (err) {
+    if (import.meta.env?.DEV) console.debug('Error fetching history:', err)
+    historyData.value = []
+    knownTimestamps.value = new Set()
+  } finally {
+    isLoading.value = false
+  }
+}
+
+async function fetchSensorInfo() {
+  try {
+    const { data } = await axios.get(`${API_BASE_URL}/sensors/${sensorId}/details`)
+    sensorInfo.value = data
+  } catch (err) {
+    if (import.meta.env?.DEV) console.debug('Error fetching sensor info:', err)
+    router.push('/')
+  }
+}
+
+// ---------- Rango / zoom ----------
 function setRange(range) {
   timeRange.value = range
-  viewEndDate.value = new Date()
-  liveMode.value = true
-  fetchHistory().then(() => {
-    chartKey.value++ // re-render limpio del chart
-  })
-}
-
-function navigateTime(direction) {
-  const hours = timeRanges[timeRange.value]
-  const newEnd = new Date(viewEndDate.value)
-  newEnd.setHours(newEnd.getHours() + (direction === 'prev' ? -hours : hours))
-  viewEndDate.value = newEnd
-
-  if (direction === 'next' && Date.now() - newEnd.getTime() < 60_000) {
-    liveMode.value = true
-    viewEndDate.value = new Date()
-  } else {
-    liveMode.value = false
-  }
-
-  fetchHistory().then(() => {
-    chartKey.value++
-  })
+  isLiveView.value = true
+  isZoomed.value = false
+  const chart = chartRef.value?.chart
+  if (chart?.resetZoom) chart.resetZoom()
+  fetchHistory()
 }
 
 function resetZoom() {
@@ -274,19 +158,25 @@ function resetZoom() {
   if (chart?.resetZoom) {
     chart.resetZoom()
     isZoomed.value = false
+    isLiveView.value = true
   }
 }
 
-// --- Eventos de enlace (solo ethernet) ---
+// ---------- Eventos de enlace (ethernet) ----------
 const linkStatusEvents = computed(() => {
-  if (!isEthernet.value || historyData.value.length === 0) return []
+  if (sensorInfo.value?.sensor_type !== 'ethernet' || historyData.value.length === 0) return []
   const events = []
   let lastStatus = null
   let lastSpeed = null
+
   historyData.value.forEach((d) => {
     if (d.status !== lastStatus || d.speed !== lastSpeed) {
+      const tsLocal = new Date(d.timestamp)
       events.push({
-        timestamp: format(d.timestamp, 'dd MMM yyyy, HH:mm:ss', { locale: es }),
+        timestamp: new Intl.DateTimeFormat('es-AR', {
+          dateStyle: 'medium',
+          timeStyle: 'medium',
+        }).format(tsLocal),
         status: d.status,
         speed: d.speed,
       })
@@ -297,7 +187,7 @@ const linkStatusEvents = computed(() => {
   return events.reverse()
 })
 
-// --- Chart ---
+// ---------- Chart config ----------
 const timeUnit = computed(() => {
   switch (timeRange.value) {
     case '1h':
@@ -316,18 +206,18 @@ const timeUnit = computed(() => {
 const chartData = computed(() => {
   if (!sensorInfo.value) return { datasets: [] }
 
-  if (isPing.value) {
-    const points = historyData.value.map((d) => ({
-      x: d.timestamp.getTime(),
-      y: Number(d.latency_ms || 0),
-    }))
+  // Alimentamos {x, y} en milisegundos locales
+  if (sensorInfo.value.sensor_type === 'ping') {
     return {
       datasets: [
         {
           label: 'Latencia (ms)',
-          data: points,
           backgroundColor: '#5372f0',
           borderColor: '#5372f0',
+          data: historyData.value.map((d) => ({
+            x: new Date(d.timestamp).valueOf(),
+            y: Number(d.latency_ms || 0),
+          })),
           tension: 0.2,
           pointRadius: 2,
         },
@@ -335,31 +225,29 @@ const chartData = computed(() => {
     }
   }
 
-  if (isEthernet.value) {
-    const rx = historyData.value.map((d) => ({
-      x: d.timestamp.getTime(),
-      y: formatBitrateForChart(d.rx_bitrate),
-    }))
-    const tx = historyData.value.map((d) => ({
-      x: d.timestamp.getTime(),
-      y: formatBitrateForChart(d.tx_bitrate),
-    }))
+  if (sensorInfo.value.sensor_type === 'ethernet') {
     return {
       datasets: [
         {
           label: 'Descarga (Mbps)',
-          data: rx,
           backgroundColor: 'rgba(54, 162, 235, 0.5)',
           borderColor: 'rgba(54, 162, 235, 1)',
+          data: historyData.value.map((d) => ({
+            x: new Date(d.timestamp).valueOf(),
+            y: formatBitrateForChart(d.rx_bitrate),
+          })),
           tension: 0.2,
           pointRadius: 2,
           fill: true,
         },
         {
           label: 'Subida (Mbps)',
-          data: tx,
           backgroundColor: 'rgba(75, 192, 192, 0.5)',
           borderColor: 'rgba(75, 192, 192, 1)',
+          data: historyData.value.map((d) => ({
+            x: new Date(d.timestamp).valueOf(),
+            y: formatBitrateForChart(d.tx_bitrate),
+          })),
           tension: 0.2,
           pointRadius: 2,
           fill: true,
@@ -372,18 +260,19 @@ const chartData = computed(() => {
 })
 
 const chartOptions = computed(() => {
-  const ethernet = isEthernet.value
+  const isEthernet = sensorInfo.value?.sensor_type === 'ethernet'
   return {
     responsive: true,
     maintainAspectRatio: false,
-    parsing: true, // usamos {x,y}
+    animation: false,
+    parsing: false, // usamos {x,y}
     scales: {
       x: {
         type: 'time',
         adapters: { date: { locale: es } },
         time: {
           unit: timeUnit.value,
-          tooltipFormat: 'dd MMM, HH:mm',
+          tooltipFormat: 'dd MMM, HH:mm:ss',
           displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'dd MMM' },
         },
         ticks: { color: '#8d8d8d' },
@@ -393,77 +282,68 @@ const chartOptions = computed(() => {
         beginAtZero: true,
         ticks: {
           color: '#8d8d8d',
-          callback: (value) => (ethernet ? `${value} Mbps` : value),
+          callback: (value) => (isEthernet ? `${value} Mbps` : value),
         },
         grid: { color: 'rgba(255, 255, 255, 0.1)' },
       },
     },
     plugins: {
-      legend: { display: ethernet, labels: { color: '#e0e0e0' } },
+      legend: { display: isEthernet, labels: { color: '#e0e0e0' } },
       tooltip: {
         callbacks: {
-          title: (items) => {
-            return format(new Date(items[0].parsed.x), 'dd MMM, HH:mm', { locale: es })
-          },
-          label: (context) => {
-            const v = context.parsed.y
-            const unit = ethernet ? 'Mbps' : 'ms'
-            const name = context.dataset.label ? `${context.dataset.label}: ` : ''
-            return `${name}${v} ${unit}`
+          label: (ctx) => {
+            let label = ctx.dataset.label ? `${ctx.dataset.label}: ` : ''
+            if (ctx.parsed.y != null) {
+              label += isEthernet ? `${ctx.parsed.y} Mbps` : `${ctx.parsed.y} ms`
+            }
+            return label
           },
         },
       },
       zoom: {
-        pan: { enabled: true, mode: 'x' },
+        // Pan con mouse presionado
+        pan: {
+          enabled: true,
+          mode: 'x',
+          onPanStart: () => {
+            isLiveView.value = false
+          },
+        },
+        // Zoom con rueda o pinza
         zoom: {
           wheel: { enabled: true },
           pinch: { enabled: true },
           mode: 'x',
-          onZoomComplete: () => (isZoomed.value = true),
+          onZoomStart: () => {
+            isLiveView.value = false
+          },
+          onZoomComplete: () => {
+            isZoomed.value = true
+          },
         },
       },
+    },
+    interaction: {
+      mode: 'nearest',
+      intersect: false,
     },
   }
 })
 
-// Actualiza datasets sin recrear el componente
-function updateChartFromState() {
-  const chart = chartRef.value?.chart
-  if (!chart) return
-
-  if (isPing.value) {
-    chart.data.datasets[0].data = historyData.value.map((d) => ({
-      x: d.timestamp.getTime(),
-      y: Number(d.latency_ms || 0),
-    }))
-  } else if (isEthernet.value) {
-    chart.data.datasets[0].data = historyData.value.map((d) => ({
-      x: d.timestamp.getTime(),
-      y: formatBitrateForChart(d.rx_bitrate),
-    }))
-    chart.data.datasets[1].data = historyData.value.map((d) => ({
-      x: d.timestamp.getTime(),
-      y: formatBitrateForChart(d.tx_bitrate),
-    }))
-  }
-
-  chart.update('none')
-}
-
-// --- Ciclo de vida ---
-onMounted(async () => {
-  await fetchSensorInfo()
-  await fetchHistory()
+// ---------- Efectos ----------
+onMounted(() => {
+  fetchSensorInfo()
+  fetchHistory()
   connectWebSocket()
-  startLiveTick()
 })
 
 onUnmounted(() => {
-  if (socket && socket.readyState !== WebSocket.CLOSED) {
-    socket.close()
+  try {
+    socket?.close()
+  } catch (err) {
+    // evita regla no-empty y no-unused-vars
+    void err
   }
-  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
-  if (liveTickTimer) clearInterval(liveTickTimer)
 })
 </script>
 
@@ -489,27 +369,31 @@ onUnmounted(() => {
           {{ range }}
         </button>
       </div>
-      <div class="navigation">
-        <button @click="navigateTime('prev')">&lt; Anterior</button>
-        <button @click="navigateTime('next')">Siguiente &gt;</button>
-      </div>
     </div>
 
     <div class="chart-container">
       <button v-if="isZoomed" @click="resetZoom" class="reset-zoom-btn">Resetear Zoom</button>
+
       <Line
         v-if="!isLoading && historyData.length > 0"
         ref="chartRef"
-        :key="chartKey"
         :data="chartData"
         :options="chartOptions"
       />
+
       <div v-else class="loading-overlay">
         <p>{{ isLoading ? 'Cargando datos...' : 'No hay historial para este rango.' }}</p>
       </div>
+
+      <div class="tz-hint">
+        Mostrando horas en tu zona: <strong>{{ localTz }}</strong>
+      </div>
     </div>
 
-    <div v-if="isEthernet && linkStatusEvents.length > 0" class="events-container">
+    <div
+      v-if="sensorInfo?.sensor_type === 'ethernet' && linkStatusEvents.length > 0"
+      class="events-container"
+    >
       <h3>Historial de Eventos del Enlace</h3>
       <table class="events-table">
         <thead>
@@ -564,6 +448,7 @@ onUnmounted(() => {
   margin: 0;
   color: var(--gray);
 }
+
 .time-controls {
   display: flex;
   justify-content: space-between;
@@ -595,6 +480,7 @@ onUnmounted(() => {
   background-color: var(--blue);
   color: white;
 }
+
 .chart-container {
   background-color: var(--surface-color);
   padding: 2rem;
@@ -620,6 +506,13 @@ onUnmounted(() => {
   display: flex;
   justify-content: center;
   align-items: center;
+}
+.tz-hint {
+  position: absolute;
+  left: 1rem;
+  bottom: 0.75rem;
+  color: var(--gray);
+  font-size: 0.85rem;
 }
 
 .events-container {

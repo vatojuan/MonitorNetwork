@@ -12,11 +12,12 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import html
 import databases
 import httpx
 import routeros_api
 import sqlalchemy
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -663,19 +664,19 @@ async def send_telegram_notification(config: dict, message_details: dict):
     if not bot_token or not chat_id:
         return
 
-    def escape_markdown(text: str) -> str:
-        escape_chars = r'_*[]()~`>#+-=|{}.!'
-        return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+    def esc(x: str) -> str:
+        # Escapa &, <, > (suficiente para parse_mode=HTML)
+        return html.escape(str(x), quote=False)
 
     text = (
-        f" *Alerta: {escape_markdown(message_details['sensor_name'])}*\n\n"
-        f"*Dispositivo:* {escape_markdown(message_details['client_name'])} ("
-        f"{escape_markdown(message_details['ip_address'])})\n"
-        f"*Motivo:* {escape_markdown(message_details['reason'])}"
+        f"<b>Alerta: {esc(message_details['sensor_name'])}</b>\n\n"
+        f"<b>Dispositivo:</b> {esc(message_details['client_name'])} ({esc(message_details['ip_address'])})\n"
+        f"<b>Motivo:</b> {esc(message_details['reason'])}"
     )
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, json=payload, timeout=10)
@@ -941,12 +942,44 @@ async def run_ping_monitor(sensor_id: int, name: str, config: dict, device_info:
 
             except Exception as e:
                 print(f"[PING#{sensor_id}] Error en ciclo: {e}")
+
+                # >>> ACTUALIZACIÓN CLAVE <<<
+                # Cuando hay excepción, persistimos y broadcast “timeout”
+                result_data = {"status": "timeout", "latency_ms": None}
+                ts = datetime.now(timezone.utc)
+
+                try:
+                    await database.execute(
+                        ping_results_table.insert().values(
+                            sensor_id=sensor_id, timestamp=ts, **result_data
+                        )
+                    )
+                except Exception as _db_e:
+                    print(f"[PING#{sensor_id}] Error guardando timeout: {_db_e}")
+
+                try:
+                    await manager.broadcast(json.dumps({
+                        "sensor_id": sensor_id,
+                        "sensor_type": "ping",
+                        **result_data,
+                        "timestamp": ts.isoformat(),
+                    }))
+                except Exception as _ws_e:
+                    print(f"[PING#{sensor_id}] Error broadcast timeout: {_ws_e}")
+
+                try:
+                    await check_and_trigger_alerts(sensor_id, name, result_data, device_info, config)
+                except Exception as _alert_e:
+                    print(f"[PING#{sensor_id}] Error alerts timeout: {_alert_e}")
+                # <<< FIN ACTUALIZACIÓN >>>
+
                 if origin_ip in connection_pools:
                     try:
                         connection_pools[origin_ip].disconnect()
                     except Exception:
                         pass
                     connection_pools.pop(origin_ip, None)
+
 
             await asyncio.sleep(interval)
     finally:
@@ -960,6 +993,13 @@ async def run_ethernet_monitor(sensor_id: int, name: str, config: dict, device_i
     device_ip = device_info["ip_address"]
 
     await _ensure_origin_connectivity(device_info)
+
+    def _parse_link_up(val: Optional[str]) -> bool:
+        if val is None:
+            return False
+        s = str(val).lower()
+        # RouterOS 6/7 monitor: status suele ser "link-ok" / "no-link"
+        return s in ("link-ok", "link_ok", "ok", "up", "running", "true", "yes")
 
     try:
         while sensor_id in running_tasks:
@@ -989,38 +1029,101 @@ async def run_ethernet_monitor(sensor_id: int, name: str, config: dict, device_i
                     )
                 api = connection_pools[device_ip].get_api()
 
-                if_data = api.get_resource("/interface/ethernet").get(name=interface_name)
-                if if_data:
-                    result_data["status"] = "link_up" if if_data[0].get("running") else "link_down"
-                    result_data["speed"] = if_data[0].get("speed", "N/A")
+                # ---- 1) MÉTODO NUEVO (ROS 7.x): monitor once ----
+                speed_ok = False
+                try:
+                    eth_res = api.get_resource("/interface/ethernet")
+                    mon = []
+                    # En ROS 7 suele ser "numbers", pero probamos ambos por compatibilidad
+                    try:
+                        mon = eth_res.call("monitor", {"numbers": interface_name, "once": ""})
+                    except Exception:
+                        mon = eth_res.call("monitor", {"interface": interface_name, "once": ""})
 
-                monitor = api.get_resource("/interface").call(
-                    "monitor-traffic", {"interface": interface_name, "once": ""}
-                )
-                if monitor:
-                    result_data["rx_bitrate"] = monitor[0].get("rx-bits-per-second", "0")
-                    result_data["tx_bitrate"] = monitor[0].get("tx-bits-per-second", "0")
+                    if mon:
+                        m = mon[0]
+                        # status: "link-ok" | "no-link"
+                        if _parse_link_up(m.get("status")):
+                            result_data["status"] = "link_up"
+                        else:
+                            result_data["status"] = "link_down"
 
+                        # rate (1Gbps / 100Mbps ...) o speed en algunos builds
+                        rate = m.get("rate") or m.get("speed")
+                        if rate:
+                            result_data["speed"] = str(rate)
+                            speed_ok = True
+                except Exception as e_mon:
+                    print(f"[ETH#{sensor_id}] monitor fallback (ROS7) error: {e_mon}")
+
+                # ---- 2) FALLBACK (ROS 6.x / compat): get /interface/ethernet ----
+                if not speed_ok:
+                    try:
+                        if_data = api.get_resource("/interface/ethernet").get(name=interface_name)
+                        if if_data:
+                            d = if_data[0]
+                            # 'running' solía indicar link up en 6.x
+                            result_data["status"] = "link_up" if d.get("running") else "link_down"
+                            result_data["speed"] = d.get("speed", result_data["speed"]) or result_data["speed"]
+                    except Exception as e_get:
+                        print(f"[ETH#{sensor_id}] ethernet get fallback error: {e_get}")
+
+                # ---- 3) Tráfico (igual para 6/7) ----
+                try:
+                    monitor = api.get_resource("/interface").call(
+                        "monitor-traffic", {"interface": interface_name, "once": ""}
+                    )
+                    if monitor:
+                        result_data["rx_bitrate"] = monitor[0].get("rx-bits-per-second", "0") or "0"
+                        result_data["tx_bitrate"] = monitor[0].get("tx-bits-per-second", "0") or "0"
+                except Exception as e_tra:
+                    # Si falla el tráfico no tumbamos el estado del link
+                    print(f"[ETH#{sensor_id}] monitor-traffic error: {e_tra}")
+
+                # Persistencia + WS + alertas
+                ts = datetime.now(timezone.utc)
                 await database.execute(
                     ethernet_results_table.insert().values(
                         sensor_id=sensor_id,
-                        timestamp=datetime.now(timezone.utc),
+                        timestamp=ts,
                         **result_data,
                     )
                 )
-
-                broadcast_data = {
+                await manager.broadcast(json.dumps({
                     "sensor_id": sensor_id,
                     "sensor_type": "ethernet",
                     **result_data,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                await manager.broadcast(json.dumps(broadcast_data))
-
+                    "timestamp": ts.isoformat(),
+                }))
                 await check_and_trigger_alerts(sensor_id, name, result_data, device_info, config)
 
             except Exception as e:
                 print(f"[ETH#{sensor_id}] Error en ciclo: {e}")
+
+                # En error duro (router inalcanzable, VPN caída), marcamos link_down
+                ts = datetime.now(timezone.utc)
+                result_data = {
+                    "status": "link_down",
+                    "speed": "N/A",
+                    "rx_bitrate": "0",
+                    "tx_bitrate": "0",
+                }
+                try:
+                    await database.execute(
+                        ethernet_results_table.insert().values(
+                            sensor_id=sensor_id, timestamp=ts, **result_data
+                        )
+                    )
+                    await manager.broadcast(json.dumps({
+                        "sensor_id": sensor_id,
+                        "sensor_type": "ethernet",
+                        **result_data,
+                        "timestamp": ts.isoformat(),
+                    }))
+                    await check_and_trigger_alerts(sensor_id, name, result_data, device_info, config)
+                except Exception as _e2:
+                    print(f"[ETH#{sensor_id}] Error guardando/broadcast en error: {_e2}")
+
                 if device_ip in connection_pools:
                     try:
                         connection_pools[device_ip].disconnect()
@@ -1031,6 +1134,7 @@ async def run_ethernet_monitor(sensor_id: int, name: str, config: dict, device_i
             await asyncio.sleep(interval)
     finally:
         await _release_origin_connectivity(device_info)
+
 
 
 # ==========================================================
@@ -1083,64 +1187,57 @@ app.add_middleware(
 # ==========================================================
 @app.post("/api/devices/test_reachability")
 async def test_device_reachability(test: IsolatedConnectionTest):
-    credential_id: Optional[int] = None
+    """
+    Prueba de alcance y credenciales usando, si corresponde, el túnel PERSISTENTE
+    del perfil (m360-p<id>) administrado por ensure_vpn_up/release_vpn.
 
+    - Si test.vpn_profile_id está presente, usa ese perfil.
+    - Si test.maestro_id está presente, usa el perfil del maestro.
+    - Evita wg-quick up/down efímeros (que generan rutas duplicadas).
+    """
+    # Conexión vía VPN (perfil explícito)
     if test.vpn_profile_id:
-        vpn = await database.fetch_one(
-            vpn_profiles_table.select().where(vpn_profiles_table.c.id == test.vpn_profile_id)
-        )
-        if not vpn:
-            raise HTTPException(status_code=404, detail="Perfil VPN no encontrado")
-
-        config_path = os.path.join(tempfile.gettempdir(), f"m360-{uuid.uuid4().hex[:8]}.conf")
         try:
-            with open(config_path, "w") as f:
-                f.write(_normalize_wg_config(vpn["config_data"]))
-            os.chmod(config_path, 0o600)
-
-            ok, out = await wg_cmd(["wg-quick", "up", config_path])
-            if not ok:
-                raise HTTPException(status_code=500, detail=f"No se pudo activar la VPN: {out}")
-
-            await asyncio.sleep(2)
-
-            # Pre-chequeo de puerto antes de probar credenciales
-            if not await tcp_port_reachable(test.ip_address, 8728, timeout_s=1.5):
-                return {"reachable": False, "detail": "Host/API RouterOS inalcanzable a través del túnel."}
-
+            await ensure_vpn_up(test.vpn_profile_id)
+            await asyncio.sleep(1)
             credential_id = await test_and_get_credential_id(test.ip_address)
-
         finally:
-            await wg_cmd(["wg-quick", "down", config_path])
-            try:
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-            except Exception:
-                pass
+            await release_vpn(test.vpn_profile_id)
 
         if credential_id:
             return {"reachable": True, "credential_id": credential_id}
         else:
-            return {
-                "reachable": False,
-                "detail": "Dispositivo no alcanzable o credenciales incorrectas a través de la VPN.",
-            }
+            return {"reachable": False, "detail": "Dispositivo no alcanzable o credenciales incorrectas a través de la VPN."}
 
-    elif test.maestro_id:
-        raise HTTPException(status_code=501, detail="Conexión vía Maestro no implementada.")
+    # Conexión vía Maestro
+    if test.maestro_id:
+        maestro = await database.fetch_one(
+            devices_table.select().where(devices_table.c.id == test.maestro_id)
+        )
+        if not maestro:
+            raise HTTPException(status_code=404, detail="Maestro no encontrado.")
+        maestro_pid = maestro["vpn_profile_id"]
+        if not maestro_pid:
+            raise HTTPException(status_code=400, detail="El maestro no tiene un perfil de VPN asociado.")
 
+        try:
+            await ensure_vpn_up(maestro_pid)
+            await asyncio.sleep(1)
+            credential_id = await test_and_get_credential_id(test.ip_address)
+        finally:
+            await release_vpn(maestro_pid)
+
+        if credential_id:
+            return {"reachable": True, "credential_id": credential_id, "used_profile_id": maestro_pid}
+        else:
+            return {"reachable": False, "detail": "No alcanzable vía túnel del maestro o credenciales inválidas.", "used_profile_id": maestro_pid}
+
+    # Conexión directa (sin VPN)
+    credential_id = await test_and_get_credential_id(test.ip_address)
+    if credential_id:
+        return {"reachable": True, "credential_id": credential_id}
     else:
-        # Conexión directa
-        if not await tcp_port_reachable(test.ip_address, 8728, timeout_s=1.5):
-            return {"reachable": False, "detail": "Host/API RouterOS inalcanzable."}
-        credential_id = await test_and_get_credential_id(test.ip_address)
-        if credential_id:
-            return {"reachable": True, "credential_id": credential_id}
-        else:
-            return {
-                "reachable": False,
-                "detail": "Dispositivo no alcanzable o credenciales incorrectas en la red local.",
-            }
+        return {"reachable": False, "detail": "Dispositivo no alcanzable o credenciales incorrectas en la red local."}
 
 
 @app.put("/api/devices/{device_id}/associate_vpn")
@@ -1180,55 +1277,57 @@ async def delete_credential(credential_id: int):
 
 @app.post("/api/devices/manual", status_code=201)
 async def add_device_manually(device: ManualDevice):
-    # Elegir VPN (explícita o default) solo para validación si se desea
+    """
+    Alta de dispositivo manual:
+      - Si viene vpn_profile_id => probar y usar ese perfil.
+      - Si NO viene vpn_profile_id pero viene maestro_id => usar el perfil de ese maestro.
+      - Si no viene nada => usar el default (si existe) o conexión directa LAN.
+
+    Guardamos en el dispositivo el vpn_profile_id elegido para que los sensores
+    puedan asegurar el túnel correcto al operar.
+    """
+    credential_id: Optional[int] = None
     vpn_to_use = None
+
+    # Determine qué perfil usar
     if device.vpn_profile_id:
         vpn_to_use = await database.fetch_one(
             vpn_profiles_table.select().where(vpn_profiles_table.c.id == device.vpn_profile_id)
         )
         if not vpn_to_use:
             raise HTTPException(status_code=404, detail="Perfil VPN no encontrado")
+    elif device.maestro_id:
+        maestro = await database.fetch_one(
+            devices_table.select().where(devices_table.c.id == device.maestro_id)
+        )
+        if not maestro:
+            raise HTTPException(status_code=404, detail="Maestro no encontrado")
+        if not maestro["vpn_profile_id"]:
+            raise HTTPException(status_code=400, detail="El maestro no tiene un perfil de VPN asociado.")
+        vpn_to_use = await database.fetch_one(
+            vpn_profiles_table.select().where(vpn_profiles_table.c.id == maestro["vpn_profile_id"])
+        )
     else:
         vpn_to_use = await database.fetch_one(
             vpn_profiles_table.select().where(vpn_profiles_table.c.is_default == True)
         )
 
-    credential_id: Optional[int] = None
-
+    # Validación de credenciales a través del túnel elegido (si aplica)
     if vpn_to_use:
-        # Prueba a través del túnel temporal
-        config_path = os.path.join(tempfile.gettempdir(), f"m360-{uuid.uuid4().hex[:8]}.conf")
+        pid = vpn_to_use["id"]
         try:
-            with open(config_path, "w") as f:
-                f.write(_normalize_wg_config(vpn_to_use["config_data"]))
-            os.chmod(config_path, 0o600)
-
-            ok, out = await wg_cmd(["wg-quick", "up", config_path])
-            if not ok:
-                raise HTTPException(status_code=500, detail=f"No se pudo activar la VPN: {out}")
-
-            await asyncio.sleep(2)
-
-            if not await tcp_port_reachable(device.ip_address, 8728, timeout_s=1.5):
-                raise HTTPException(status_code=502, detail="Host/API RouterOS inalcanzable a través del túnel.")
-
+            await ensure_vpn_up(pid)
+            await asyncio.sleep(1)
             credential_id = await test_and_get_credential_id(device.ip_address)
         finally:
-            await wg_cmd(["wg-quick", "down", config_path])
-            try:
-                if os.path.exists(config_path):
-                    os.remove(config_path)
-            except Exception:
-                pass
+            await release_vpn(pid)
     else:
-        # Directo LAN
-        if not await tcp_port_reachable(device.ip_address, 8728, timeout_s=1.5):
-            raise HTTPException(status_code=502, detail="Host/API RouterOS inalcanzable.")
         credential_id = await test_and_get_credential_id(device.ip_address)
 
     if not credential_id:
         raise HTTPException(status_code=401, detail=f"Autenticación fallida en {device.ip_address}.")
 
+    # Crear el dispositivo
     device_id = str(uuid.uuid4())
     insert_values = {
         "id": device_id,
@@ -1239,14 +1338,13 @@ async def add_device_manually(device: ManualDevice):
         "status": "MANUAL",
         "credential_id": credential_id,
         "maestro_id": device.maestro_id,
+        # Guardamos el perfil usado (propio, del maestro o default)
         "vpn_profile_id": device.vpn_profile_id if device.vpn_profile_id else (vpn_to_use["id"] if vpn_to_use else None),
     }
 
     try:
         await database.execute(devices_table.insert().values(**insert_values))
-        created = await database.fetch_one(
-            devices_table.select().where(devices_table.c.id == device_id)
-        )
+        created = await database.fetch_one(devices_table.select().where(devices_table.c.id == device_id))
         return created
     except Exception:
         raise HTTPException(status_code=400, detail="Un dispositivo con esta IP ya existe.")
@@ -1404,22 +1502,36 @@ async def get_sensor_details(sensor_id: int):
 
 
 @app.get("/api/sensors/{sensor_id}/history_range")
-async def get_sensor_history(sensor_id: int, start: datetime, end: datetime):
+async def get_sensor_history(sensor_id: int, time_range: str = Query("24h")):
     sensor = await database.fetch_one(
         sensors_table.select().where(sensors_table.c.id == sensor_id)
     )
     if not sensor:
         raise HTTPException(status_code=404, detail="Sensor no encontrado")
+
+    # 1. Mapeamos el texto del rango (ej: "24h") a un número de horas
+    range_map = {"1h": 1, "12h": 12, "24h": 24, "7d": 168, "30d": 720}
+    hours_to_subtract = range_map.get(time_range, 24)  # default 24h
+
+    # 2. Fechas en UTC para consistencia
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(hours=hours_to_subtract)
+
+    # 3. Tabla según tipo de sensor
     history_table = {
         "ping": ping_results_table,
         "ethernet": ethernet_results_table,
     }.get(sensor["sensor_type"])
+
     if history_table is None:
         return []
+
+    # 4. Consulta con rango y orden
     query = (
         history_table.select()
         .where(history_table.c.sensor_id == sensor_id)
-        .where(history_table.c.timestamp.between(start, end))
+        .where(history_table.c.timestamp.between(start_date, end_date))
+        .order_by(history_table.c.timestamp.asc())
     )
     return await database.fetch_all(query)
 
@@ -1561,7 +1673,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ==========================================================
-# Endpoint de depuración de WG (opcional)
+# Endpoints de depuración (opcionales)
 # ==========================================================
 @app.get("/api/_debug/wg")
 async def debug_wg():
@@ -1573,4 +1685,15 @@ async def debug_wg():
         "wg_show_ok": wg_show[0],
         "wg_show": wg_show[1],
         "vpn_state": VPN_STATE,
+    }
+
+@app.get("/api/_debug/routes")
+async def debug_routes():
+    r1 = await wg_cmd(["ip", "-4", "route"])
+    r2 = await wg_cmd(["ip", "-6", "route"])
+    r3 = await wg_cmd(["ip", "rule"])
+    return {
+        "ipv4_route_ok": r1[0], "ipv4_route": r1[1],
+        "ipv6_route_ok": r2[0], "ipv6_route": r2[1],
+        "ip_rule_ok": r3[0],   "ip_rule": r3[1],
     }
