@@ -1,8 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import axios from 'axios'
-
-const API_BASE_URL = 'http://127.0.0.1:8000/api'
+import api from '@/lib/api' // 👈 cliente central con Authorization automático
 
 const currentTab = ref('channels')
 const notification = ref({ show: false, message: '', type: 'success' })
@@ -26,28 +24,34 @@ onMounted(() => {
 
 function showNotification(message, type = 'success') {
   notification.value = { show: true, message, type }
-  setTimeout(() => {
-    notification.value.show = false
-  }, 4000)
+  setTimeout(() => (notification.value.show = false), 4000)
+}
+
+function safeParse(jsonLike) {
+  try {
+    return typeof jsonLike === 'string' ? JSON.parse(jsonLike) : jsonLike || {}
+  } catch {
+    return {}
+  }
 }
 
 async function fetchChannels() {
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/channels`)
-    channels.value = data.map((ch) => ({ ...ch, config: JSON.parse(ch.config) }))
+    const { data } = await api.get('/channels')
+    channels.value = (data || []).map((ch) => ({ ...ch, config: safeParse(ch.config) }))
   } catch (err) {
     console.error('Error al cargar canales:', err)
-    showNotification('Error al cargar canales.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al cargar canales.', 'error')
   }
 }
 
 async function fetchHistory() {
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/alerts/history`)
-    history.value = data
+    const { data } = await api.get('/alerts/history')
+    history.value = Array.isArray(data) ? data : []
   } catch (err) {
     console.error('Error al cargar historial:', err)
-    showNotification('Error al cargar historial.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al cargar historial.', 'error')
   }
 }
 
@@ -59,16 +63,16 @@ async function handleFetchChats() {
   availableChats.value = []
   newChannel.value.telegram.chat_id = ''
   try {
-    const { data } = await axios.post(`${API_BASE_URL}/channels/telegram/get_chats`, {
+    const { data } = await api.post('/channels/telegram/get_chats', {
       bot_token: newChannel.value.telegram.bot_token,
     })
-    if (data.length === 0) {
+    if (!Array.isArray(data) || data.length === 0) {
       showNotification(
         'No se encontraron chats recientes. Asegúrate de que tu bot esté en un grupo o hayas iniciado una conversación con él.',
         'error',
       )
     }
-    availableChats.value = data
+    availableChats.value = data || []
   } catch (err) {
     console.error('Error al buscar chats:', err)
     showNotification(err.response?.data?.detail || 'Error al buscar chats.', 'error')
@@ -80,36 +84,37 @@ async function handleFetchChats() {
 async function handleAddChannel() {
   let payload
   if (newChannelType.value === 'webhook') {
-    if (!newChannel.value.name || !newChannel.value.webhook.url) {
+    if (!newChannel.value.name.trim() || !newChannel.value.webhook.url.trim()) {
       return showNotification('Nombre y URL son obligatorios.', 'error')
     }
     payload = {
-      name: newChannel.value.name,
+      name: newChannel.value.name.trim(),
       type: 'webhook',
-      config: { url: newChannel.value.webhook.url },
+      config: { url: newChannel.value.webhook.url.trim() },
     }
   } else {
     // telegram
     if (
-      !newChannel.value.name ||
-      !newChannel.value.telegram.bot_token ||
+      !newChannel.value.name.trim() ||
+      !newChannel.value.telegram.bot_token.trim() ||
       !newChannel.value.telegram.chat_id
     ) {
       return showNotification('Todos los campos de Telegram son obligatorios.', 'error')
     }
     payload = {
-      name: newChannel.value.name,
+      name: newChannel.value.name.trim(),
       type: 'telegram',
       config: {
-        bot_token: newChannel.value.telegram.bot_token,
+        bot_token: newChannel.value.telegram.bot_token.trim(),
         chat_id: newChannel.value.telegram.chat_id,
       },
     }
   }
 
   try {
-    await axios.post(`${API_BASE_URL}/channels`, payload)
+    await api.post('/channels', payload)
     showNotification('Canal añadido.', 'success')
+    // reset
     newChannel.value = { name: '', webhook: { url: '' }, telegram: { bot_token: '', chat_id: '' } }
     newChannelType.value = 'webhook'
     availableChats.value = []
@@ -123,19 +128,19 @@ async function handleAddChannel() {
 async function handleDeleteChannel(id) {
   if (!confirm('¿Seguro? Los sensores que usen este canal dejarán de notificar.')) return
   try {
-    await axios.delete(`${API_BASE_URL}/channels/${id}`)
+    await api.delete(`/channels/${id}`)
     showNotification('Canal eliminado.', 'success')
     fetchChannels()
   } catch (err) {
     console.error('Error al eliminar canal:', err)
-    showNotification('Error al eliminar canal.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al eliminar canal.', 'error')
   }
 }
 
 function formatHistoryDetails(details) {
   try {
-    const parsed = JSON.parse(details)
-    return `${parsed.reason}`
+    const parsed = safeParse(details)
+    return parsed?.reason || details
   } catch {
     return details
   }
@@ -261,6 +266,7 @@ function formatHistoryDetails(details) {
             <button type="submit">Añadir Canal de Telegram</button>
           </form>
         </div>
+
         <div class="control-section">
           <h2><i class="icon">📡</i> Canales Guardados</h2>
           <ul v-if="channels.length > 0" class="item-list">
@@ -299,6 +305,10 @@ function formatHistoryDetails(details) {
         </table>
         <div v-else class="empty-list">No se han registrado alertas.</div>
       </section>
+    </div>
+
+    <div v-if="notification.show" :class="['notification', notification.type]">
+      {{ notification.message }}
     </div>
   </div>
 </template>

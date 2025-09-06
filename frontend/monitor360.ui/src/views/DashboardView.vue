@@ -1,32 +1,17 @@
+<!-- src/views/DashboardView.vue -->
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
-import axios from 'axios'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import api from '@/lib/api'
+import { connectWebSocketWhenAuthenticated, addWsListener, getCurrentWebSocket } from '@/lib/ws'
+import { waitForSession } from '@/lib/supabase'
 
 const router = useRouter()
-
-// ===== Config dinámico (API y WS) =====
-const API_PROTO = window.location.protocol // 'http:' | 'https:'
-const API_HOST = window.location.hostname // ej: 'localhost' | '127.0.0.1'
-const API_PORT = 8000
-const API_BASE = `${API_PROTO}//${API_HOST}:${API_PORT}`
-
-const WS_PROTO = API_PROTO === 'https:' ? 'wss' : 'ws'
-const WS_URL = `${WS_PROTO}://${API_HOST}:${API_PORT}/ws`
-
-// Axios instance
-const http = axios.create({
-  baseURL: API_BASE,
-  timeout: 15000,
-})
 
 const monitors = ref([])
 const liveSensorStatus = ref({})
 const monitorToDelete = ref(null)
 const sensorDetailsToShow = ref(null)
-
-let socket = null
-let wsRetryTimer = null
 
 // --- Canales (para mostrar nombre en alertas) ---
 const channelsById = ref({})
@@ -34,14 +19,31 @@ const channelsById = ref({})
 async function ensureChannelsLoaded() {
   if (Object.keys(channelsById.value).length) return
   try {
-    const { data } = await http.get('/api/channels')
+    const { data } = await api.get('/channels')
     const map = {}
     ;(Array.isArray(data) ? data : []).forEach((c) => {
       map[c.id] = c
     })
     channelsById.value = map
   } catch (e) {
-    console.error('Error cargando canales:', e)
+    if (import.meta?.env?.DEV) {
+      console.error('Error cargando canales:', e?.message || e)
+    }
+  }
+}
+
+// DEBUG: ver lo que llega por WS
+const lastWsEvents = ref([]) // [{t, k, payload}]
+function pushWsEvent(k, payload) {
+  try {
+    lastWsEvents.value = [
+      { t: new Date().toISOString(), k, payload },
+      ...lastWsEvents.value.slice(0, 19),
+    ]
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.debug('[WS] pushWsEvent error:', err?.message || err)
+    }
   }
 }
 
@@ -61,16 +63,18 @@ function toDisplay(v) {
     if (v == null) return '—'
     if (typeof v === 'object') return JSON.stringify(v, null, 2)
     return String(v)
-  } catch {
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.warn('toDisplay err:', err?.message || err)
+    }
     return String(v)
   }
 }
 function isMultilineValue(v) {
   if (v == null) return false
   if (typeof v === 'object') return true
-  const s = String(v)
-  const t = s.trim()
-  return t.includes('\n') || t.length > 80 || t.startsWith('{') || t.startsWith('[')
+  const s = String(v).trim()
+  return s.includes('\n') || s.length > 80 || s.startsWith('{') || s.startsWith('[')
 }
 
 function alertTypeLabel(t) {
@@ -88,66 +92,215 @@ function alertTypeLabel(t) {
   }
 }
 
-// --- WebSocket con reconexión y URL dinámica ---
-function connectWebSocket() {
-  // Evita abrir más de una conexión
-  if (
-    socket &&
-    (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
-  ) {
-    return
-  }
+/**
+ * Normaliza distintos formatos de payload que pueden venir por WS.
+ * Devuelve un array de objetos de estado { sensor_id, status, ... } listos para aplicar.
+ */
+function normalizeWsPayload(raw) {
+  // Array de updates
+  if (Array.isArray(raw)) return raw.flatMap(normalizeWsPayload)
 
-  socket = new WebSocket(WS_URL)
-
-  socket.onopen = () => {
-    if (wsRetryTimer) {
-      clearTimeout(wsRetryTimer)
-      wsRetryTimer = null
-    }
-  }
-
-  socket.onmessage = (event) => {
+  // String JSON
+  if (typeof raw === 'string') {
     try {
-      const data = JSON.parse(event.data)
-      // data esperado: { sensor_id, sensor_type, ... }
-      liveSensorStatus.value[data.sensor_id] = data
-    } catch (e) {
-      console.error('WS message parse error:', e)
+      return normalizeWsPayload(JSON.parse(raw))
+    } catch {
+      return []
     }
   }
 
-  socket.onclose = () => {
-    wsRetryTimer = setTimeout(connectWebSocket, 5000)
+  // Objeto
+  if (raw && typeof raw === 'object') {
+    // { type: 'sensor_batch', items: [...] }
+    if (raw.type === 'sensor_batch' && Array.isArray(raw.items)) {
+      return raw.items
+    }
+
+    // { type:'sensor_update' | 'sensor-status' | event:'sensor_update', data:{...} }
+    if (
+      raw.type === 'sensor_update' ||
+      raw.type === 'sensor-status' ||
+      raw.event === 'sensor_update'
+    ) {
+      const inner = raw.data || raw.payload || raw.sensor || raw.body || null
+      if (inner && typeof inner === 'object') return [inner]
+    }
+
+    // Mensajes de control
+    if (raw.type === 'welcome' || raw.type === 'ready' || raw.type === 'pong') {
+      return []
+    }
+
+    // Estructura plana: { sensor_id, ... }
+    if (Object.prototype.hasOwnProperty.call(raw, 'sensor_id')) return [raw]
   }
 
-  socket.onerror = (error) => {
-    console.error('Error de WebSocket:', error)
-    if (
-      socket &&
-      socket.readyState !== WebSocket.CLOSING &&
-      socket.readyState !== WebSocket.CLOSED
-    ) {
-      socket.close()
+  return []
+}
+
+/* ================= SUBSCRIPCIÓN EXPLÍCITA A SENSORES ================ */
+const lastSubscribedIds = ref([])
+
+function currentSensorIds() {
+  const ids = []
+  for (const m of monitors.value) {
+    for (const s of m.sensors || []) ids.push(s.id)
+  }
+  return ids
+}
+
+function trySubscribeSensors() {
+  const ws = getCurrentWebSocket()
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  const ids = currentSensorIds()
+  if (!ids.length) return
+
+  // Evitar enviar suscripción idéntica
+  const same =
+    ids.length === lastSubscribedIds.value.length &&
+    ids.every((v, i) => v === lastSubscribedIds.value[i])
+  if (same) return
+
+  try {
+    ws.send(JSON.stringify({ type: 'subscribe_sensors', sensor_ids: ids }))
+    lastSubscribedIds.value = ids.slice()
+    if (import.meta?.env?.DEV) {
+      console.debug('[WS] subscribe_sensors:', ids)
+    }
+  } catch (e) {
+    if (import.meta?.env?.DEV) {
+      console.debug('[WS] subscribe_sensors failed:', e?.message || e)
     }
   }
 }
 
-onMounted(() => {
-  fetchAllMonitors()
-  connectWebSocket()
+watch(
+  () => monitors.value.map((m) => (m.sensors || []).map((s) => s.id)).flat(),
+  () => trySubscribeSensors(),
+)
+/* ==================================================================== */
+
+// ---- Enviar sync + subscribes cuando el WS esté listo o se reconecte ----
+let wsOpenUnbind = null
+function wireWsSyncAndSubs() {
+  const ws = getCurrentWebSocket()
+  if (!ws) return
+
+  const sendSyncAndSubs = () => {
+    try {
+      ws.send(JSON.stringify({ type: 'sync_request', resource: 'sensors_latest' }))
+    } catch (err) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[WS] sync_request failed:', err?.message || err)
+      }
+    }
+    trySubscribeSensors()
+  }
+
+  // Si ya está abierto, disparar ahora
+  if (ws.readyState === WebSocket.OPEN) {
+    sendSyncAndSubs()
+  }
+
+  // Y también en cada reconexión
+  const onOpen = () => {
+    sendSyncAndSubs()
+  }
+  ws.addEventListener('open', onOpen)
+  wsOpenUnbind = () => {
+    try {
+      ws.removeEventListener('open', onOpen)
+    } catch (err) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[WS] removeEventListener open failed:', err?.message || err)
+      }
+    }
+  }
+}
+
+// ---- Listener de BUS (tiempo real) ----
+let offBus = null
+function attachBusListener() {
+  offBus = addWsListener((parsed) => {
+    // Traza
+    const kind =
+      parsed?.type ?? (Array.isArray(parsed) ? 'array' : (parsed && typeof parsed) || 'unknown')
+    pushWsEvent(kind, parsed)
+
+    // Normalizar a array de updates
+    const updates = normalizeWsPayload(parsed)
+    if (!updates.length) return
+
+    // Aplicar reactivamente (inmutable) para forzar repintado de tarjetas
+    const newMap = { ...liveSensorStatus.value }
+    for (const u of updates) {
+      if (u && u.sensor_id != null) {
+        const prev = newMap[u.sensor_id] || {}
+        newMap[u.sensor_id] = { ...prev, ...u }
+      }
+    }
+    liveSensorStatus.value = newMap
+  })
+}
+
+/* ====================== mounted / unmounted ========================= */
+onMounted(async () => {
+  // Asegurar sesión antes de cargar y abrir WS
+  try {
+    await waitForSession({ requireAuth: true, timeoutMs: 8000 })
+  } catch (e) {
+    if (import.meta?.env?.DEV) {
+      console.warn('[Auth] No hay sesión, redirigiendo a /login:', e?.message || e)
+    }
+    try {
+      router.push({ name: 'login', query: { redirect: router.currentRoute.value.fullPath } })
+    } catch (err) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[Router] push /login fallo:', err?.message || err)
+      }
+    }
+    return
+  }
+
+  await fetchAllMonitors()
+
+  // Conecta WS global (idempotente) y cablea bus + subs
+  try {
+    await connectWebSocketWhenAuthenticated()
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.warn('[WS] connectWhenAuthenticated falló (continuamos):', err?.message || err)
+    }
+  }
+  attachBusListener()
+  wireWsSyncAndSubs()
 })
 
 onUnmounted(() => {
-  if (wsRetryTimer) clearTimeout(wsRetryTimer)
-  if (socket && socket.readyState !== WebSocket.CLOSED) {
-    socket.close()
+  if (typeof offBus === 'function') {
+    try {
+      offBus()
+    } catch (e) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[WS] offBus error:', e?.message || e)
+      }
+    }
+  }
+  if (typeof wsOpenUnbind === 'function') {
+    try {
+      wsOpenUnbind()
+    } catch (e) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[WS] wsOpenUnbind error:', e?.message || e)
+      }
+    }
   }
 })
 
+/* ====================== API helpers ========================= */
 async function fetchAllMonitors() {
   try {
-    const { data } = await http.get('/api/monitors')
+    const { data } = await api.get('/monitors')
     monitors.value = Array.isArray(data) ? data : []
 
     // Inicializar estados "pending" para sensores sin datos aún
@@ -158,12 +311,18 @@ async function fetchAllMonitors() {
         }
       })
     })
+
+    // intentar suscribir (por si el WS ya está abierto)
+    trySubscribeSensors()
   } catch (err) {
-    console.error('Error fetching monitors:', err)
+    if (import.meta?.env?.DEV) {
+      console.error('Error fetching monitors:', err?.message || err)
+    }
     monitors.value = []
   }
 }
 
+/* ====================== UI actions ========================= */
 function requestDeleteMonitor(monitor, event) {
   if (event?.stopPropagation) event.stopPropagation()
   monitorToDelete.value = monitor
@@ -172,10 +331,12 @@ function requestDeleteMonitor(monitor, event) {
 async function confirmDeleteMonitor() {
   if (!monitorToDelete.value) return
   try {
-    await http.delete(`/api/monitors/${monitorToDelete.value.monitor_id}`)
+    await api.delete(`/monitors/${monitorToDelete.value.monitor_id}`)
     monitors.value = monitors.value.filter((m) => m.monitor_id !== monitorToDelete.value.monitor_id)
   } catch (err) {
-    console.error('Error deleting monitor:', err)
+    if (import.meta?.env?.DEV) {
+      console.error('Error deleting monitor:', err?.message || err)
+    }
   } finally {
     monitorToDelete.value = null
   }
@@ -218,7 +379,10 @@ const normalizedConfig = computed(() => {
   if (cfg && typeof cfg === 'string') {
     try {
       return JSON.parse(cfg)
-    } catch {
+    } catch (e) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[Modal] config JSON inválido:', e?.message || e)
+      }
       return {}
     }
   }
@@ -277,7 +441,6 @@ const alertsForModal = computed(() => {
 
 <template>
   <div>
-    <!-- Modal eliminar monitor -->
     <div v-if="monitorToDelete" class="modal-overlay" @click.self="monitorToDelete = null">
       <div class="modal-content">
         <h3>Confirmar Eliminación</h3>
@@ -287,13 +450,12 @@ const alertsForModal = computed(() => {
           >?
         </p>
         <div class="modal-actions">
-          <button @click="monitorToDelete = null" class="btn-secondary">Cancelar</button>
-          <button @click="confirmDeleteMonitor" class="btn-danger">Eliminar</button>
+          <button class="btn-secondary" @click="monitorToDelete = null">Cancelar</button>
+          <button class="btn-danger" @click="confirmDeleteMonitor">Eliminar</button>
         </div>
       </div>
     </div>
 
-    <!-- Modal detalles de sensor -->
     <div v-if="sensorDetailsToShow" class="modal-overlay" @click.self="sensorDetailsToShow = null">
       <div class="modal-content">
         <h3>Detalles del Sensor: {{ sensorDetailsToShow.name }}</h3>
@@ -337,7 +499,7 @@ const alertsForModal = computed(() => {
         </div>
 
         <div class="modal-actions">
-          <button @click="sensorDetailsToShow = null" class="btn-secondary">Cerrar</button>
+          <button class="btn-secondary" @click="sensorDetailsToShow = null">Cerrar</button>
         </div>
       </div>
     </div>
@@ -360,7 +522,7 @@ const alertsForModal = computed(() => {
           <h3>{{ monitor.client_name }}</h3>
           <span class="device-info-header">{{ monitor.ip_address }}</span>
           <span v-if="getOverallCardStatus(monitor)" class="alert-icon">⚠️</span>
-          <button @click="requestDeleteMonitor(monitor, $event)" class="remove-btn">×</button>
+          <button class="remove-btn" @click="requestDeleteMonitor(monitor, $event)">×</button>
         </div>
 
         <div class="card-body">
@@ -418,7 +580,7 @@ const alertsForModal = computed(() => {
                   </template>
                 </div>
 
-                <button @click="showSensorDetails(sensor, $event)" class="details-btn">⋮</button>
+                <button class="details-btn" @click="showSensorDetails(sensor, $event)">⋮</button>
               </div>
             </div>
           </div>
@@ -560,8 +722,6 @@ const alertsForModal = computed(() => {
   text-align: center;
   padding: 1rem;
 }
-
-/* ===== Modal ===== */
 .modal-overlay {
   position: fixed;
   top: 0;
@@ -581,8 +741,6 @@ const alertsForModal = computed(() => {
   max-width: 700px;
   width: 92%;
   text-align: left;
-
-  /* Evita que el contenido explote la pantalla */
   max-height: 80vh;
   overflow: auto;
 }
@@ -607,8 +765,6 @@ const alertsForModal = computed(() => {
   background-color: var(--secondary-color);
   color: white;
 }
-
-/* ===== Tabla de detalles (config general) ===== */
 .details-table {
   width: 100%;
   text-align: left;
@@ -629,13 +785,13 @@ const alertsForModal = computed(() => {
 .details-table td {
   color: white;
   white-space: normal;
-  word-break: break-word; /* mejor que break-all */
+  word-break: break-word;
 }
 .value-pre {
   background: rgba(255, 255, 255, 0.06);
   padding: 0.6rem 0.75rem;
   border-radius: 8px;
-  white-space: pre-wrap; /* respeta saltos de línea */
+  white-space: pre-wrap;
   word-break: normal;
   font-family:
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
@@ -644,8 +800,6 @@ const alertsForModal = computed(() => {
   line-height: 1.25rem;
   margin: 0;
 }
-
-/* ===== Tabla de alertas “bonita” ===== */
 .alerts-section {
   margin-top: 1.25rem;
 }

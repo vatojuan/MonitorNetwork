@@ -1,20 +1,168 @@
+<!-- src/App.vue -->
 <script setup>
-import { RouterLink, RouterView } from 'vue-router'
+import { ref, reactive, onMounted, onBeforeUnmount, computed } from 'vue'
+import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
+import { supabase } from '@/lib/supabase'
 import logo from '@/assets/logo.svg'
+
+// 🔌 WS
+import { connectWebSocketWhenAuthenticated, addWsListener, getCurrentWebSocket } from '@/lib/ws'
+
+const route = useRoute()
+const router = useRouter()
+
+// Auth/session
+const session = ref(null)
+const userEmail = ref('')
+
+// Ocultar chrome en rutas que lo pidan
+const hideChrome = computed(() => route.meta?.hideChrome === true)
+
+// Estado de tiempo real para mostrar en el header
+const live = reactive({
+  connected: false,
+  lastMsgIso: null, // ISO de la última actualización (batch o update)
+  lastPingMs: null, // latency_ms de sensor ping
+  lastSensorId: null, // último sensor_id que actualizó
+})
+
+// Tooltip del chip de estado
+const liveTooltip = computed(() => {
+  const parts = []
+  parts.push(live.connected ? 'WS: conectado' : 'WS: reconectando')
+  if (live.lastPingMs != null) parts.push(`ping: ${Math.round(live.lastPingMs)} ms`)
+  if (live.lastMsgIso) parts.push(`última: ${new Date(live.lastMsgIso).toLocaleString()}`)
+  if (live.lastSensorId != null) parts.push(`sensor_id: ${live.lastSensorId}`)
+  return parts.join(' · ')
+})
+
+async function getSession() {
+  const { data } = await supabase.auth.getSession()
+  session.value = data.session
+  userEmail.value = data.session?.user?.email || ''
+}
+
+async function logout() {
+  try {
+    await supabase.auth.signOut()
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.warn('[auth] signOut error:', err?.message || err)
+    }
+  }
+  session.value = null
+  userEmail.value = ''
+  router.push('/login')
+}
+
+// Mantener live.connected coherente incluso si el WS rota internamente
+let wsStateTimer = null
+function startWsStatePolling() {
+  stopWsStatePolling()
+  wsStateTimer = setInterval(() => {
+    try {
+      const ws = getCurrentWebSocket()
+      const state = ws?.readyState
+      live.connected = state === WebSocket.OPEN
+    } catch (err) {
+      // si algo falla leyendo el estado, marcamos desconectado y seguimos
+      live.connected = false
+      if (import.meta?.env?.DEV) {
+        console.debug('[WS] state poll error:', err?.message || err)
+      }
+    }
+  }, 1500)
+}
+function stopWsStatePolling() {
+  if (wsStateTimer) {
+    clearInterval(wsStateTimer)
+    wsStateTimer = null
+  }
+}
+
+let offWsListener = null
+let offAuthSub = null
+
+onMounted(async () => {
+  await getSession()
+
+  // Suscripción a cambios de sesión
+  const { data: sub } = supabase.auth.onAuthStateChange(async (_event, s) => {
+    session.value = s
+    userEmail.value = s?.user?.email || ''
+  })
+  offAuthSub = () => {
+    try {
+      sub?.subscription?.unsubscribe()
+    } catch (err) {
+      if (import.meta?.env?.DEV) {
+        console.debug('[auth] unsubscribe error:', err?.message || err)
+      }
+    }
+  }
+
+  // Asegurar conexión WS global (idempotente)
+  try {
+    await connectWebSocketWhenAuthenticated()
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.warn('[WS] connect on App.vue failed (continuamos):', err?.message || err)
+    }
+  }
+
+  // Polling del estado de conexión (cubre rotaciones de socket)
+  startWsStatePolling()
+
+  // Listener de mensajes en vivo
+  offWsListener = addWsListener((msg) => {
+    if (!msg || typeof msg !== 'object') return
+
+    // Última marca de tiempo (preferimos timestamp del mensaje)
+    const ts = (typeof msg.timestamp === 'string' && msg.timestamp) || new Date().toISOString()
+    live.lastMsgIso = ts
+
+    // Si es ping, reflejamos latency y sensor_id
+    if (msg.sensor_type === 'ping' && Object.prototype.hasOwnProperty.call(msg, 'sensor_id')) {
+      live.lastSensorId = msg.sensor_id
+      if (Object.prototype.hasOwnProperty.call(msg, 'latency_ms')) {
+        live.lastPingMs = msg.latency_ms
+      }
+    }
+  })
+})
+
+onBeforeUnmount(() => {
+  try {
+    if (typeof offWsListener === 'function') offWsListener()
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.debug('[WS] offWsListener error:', err?.message || err)
+    }
+  }
+  try {
+    if (typeof offAuthSub === 'function') offAuthSub()
+  } catch (err) {
+    if (import.meta?.env?.DEV) {
+      console.debug('[auth] offAuthSub error:', err?.message || err)
+    }
+  }
+  stopWsStatePolling()
+})
 </script>
 
 <template>
   <div id="app-layout">
+    <!-- Header SIEMPRE visible para mantener logo/título -->
     <header class="main-header">
       <div class="header-container">
-        <!-- Logo + Título bien pegados a la izquierda -->
+        <!-- Logo + Título (siempre visibles) -->
         <div class="title-group">
           <img :src="logo" alt="Monitor360 Logo" class="logo" />
           <h1 class="title-gradient">Monitor360</h1>
         </div>
 
-        <!-- Navegación centrada -->
-        <nav class="main-nav">
+        <!-- Navegación (oculta en páginas con hideChrome, p.ej. login) -->
+        <nav class="main-nav" v-if="!hideChrome">
           <RouterLink to="/">Dashboard</RouterLink>
           <RouterLink to="/monitor-builder">Añadir Monitor</RouterLink>
           <RouterLink to="/devices">Gestionar Dispositivos</RouterLink>
@@ -22,6 +170,39 @@ import logo from '@/assets/logo.svg'
           <RouterLink to="/channels">Canales</RouterLink>
           <RouterLink to="/vpns">VPNs</RouterLink>
         </nav>
+
+        <!-- Usuario + Logout + Chip tiempo real (oculto cuando hideChrome) -->
+        <div v-if="!hideChrome" class="right-box">
+          <!-- Chip de estado WS -->
+          <div
+            class="realtime-chip"
+            :class="{ ok: live.connected, warn: !live.connected }"
+            :title="liveTooltip"
+            aria-label="Estado tiempo real"
+          >
+            <span class="dot" />
+            <span class="label">{{ live.connected ? 'Tiempo real' : 'Reconectando…' }}</span>
+            <span v-if="live.lastPingMs != null" class="sep">•</span>
+            <span v-if="live.lastPingMs != null" class="metric"
+              >ping {{ Math.round(live.lastPingMs) }} ms</span
+            >
+            <span v-if="live.lastMsgIso" class="sep">•</span>
+            <span v-if="live.lastMsgIso" class="metric">
+              {{ new Date(live.lastMsgIso).toLocaleTimeString() }}
+            </span>
+          </div>
+
+          <div v-if="session" class="user-box">
+            <span class="user-icon" :title="userEmail" aria-label="Usuario">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                <path
+                  d="M12 12c2.761 0 5-2.686 5-6s-2.239-6-5-6-5 2.686-5 6 2.239 6 5 6zm0 2c-4.418 0-8 2.91-8 6.5V22h16v-1.5c0-3.59-3.582-6.5-8-6.5z"
+                />
+              </svg>
+            </span>
+            <button class="btn-logout" @click="logout">Cerrar sesión</button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -92,7 +273,7 @@ body {
   display: flex;
   align-items: center;
   gap: 1.25rem;
-  margin-right: auto; /* fuerza a la izquierda */
+  margin-right: auto;
 }
 
 .logo {
@@ -116,7 +297,7 @@ body {
 .main-nav {
   flex-grow: 1;
   display: flex;
-  justify-content: center; /* centra el nav */
+  justify-content: center;
   gap: 1.25rem;
 }
 
@@ -138,6 +319,86 @@ body {
 
 .main-nav a:hover:not(.router-link-exact-active) {
   background-color: var(--primary-color);
+  color: #fff;
+}
+
+/* ===== Lado derecho header ===== */
+.right-box {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+/* ===== Chip estado tiempo real ===== */
+.realtime-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: #eaeaea;
+  font-size: 0.85rem;
+}
+.realtime-chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: #ffbf47; /* por defecto (warn) */
+}
+.realtime-chip.ok .dot {
+  background: #3ddc84;
+}
+.realtime-chip.warn .dot {
+  background: #ffbf47;
+}
+.realtime-chip .label {
+  font-weight: 600;
+}
+.realtime-chip .sep {
+  opacity: 0.6;
+}
+.realtime-chip .metric {
+  opacity: 0.95;
+}
+
+/* ===== User box ===== */
+.user-box {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.user-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid #2a2a2a;
+  background: #0e0e0e;
+  display: grid;
+  place-items: center;
+  color: #eaeaea;
+}
+
+.user-icon svg {
+  fill: #eaeaea;
+  display: block;
+}
+
+.btn-logout {
+  background: transparent;
+  border: 1px solid var(--secondary-color);
+  border-radius: 6px;
+  color: var(--secondary-color);
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: 0.2s;
+}
+.btn-logout:hover {
+  background: var(--secondary-color);
   color: #fff;
 }
 
@@ -166,7 +427,6 @@ body {
     font-size: 2rem;
   }
 }
-
 @media (max-width: 768px) {
   .logo {
     height: 56px;
@@ -175,7 +435,6 @@ body {
     font-size: 1.8rem;
   }
 }
-
 @media (max-width: 480px) {
   .logo {
     height: 48px;

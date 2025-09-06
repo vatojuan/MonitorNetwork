@@ -1,12 +1,8 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
-import axios from 'axios'
+import api from '@/lib/api' // ← usamos el cliente central (con Bearer)
 
-// --- Endpoints dinámicos (evita mezclar 127.0.0.1/localhost) ---
-const API_PROTO = window.location.protocol
-const HOST = window.location.hostname
-const API_BASE_URL = `${API_PROTO}//${HOST}:8000/api`
-
+//
 // --- Estado General ---
 const searchQuery = ref('')
 const searchResults = ref([])
@@ -23,6 +19,7 @@ const channels = ref([])
 const sensorToEdit = ref(null) // Contendrá el sensor que se está editando
 const isEditMode = ref(false)
 
+//
 // --- Plantillas de Formularios ---
 const createNewPingSensor = () => ({
   name: '',
@@ -57,6 +54,7 @@ const createNewEthernetSensor = () => ({
 const newPingSensor = ref(createNewPingSensor())
 const newEthernetSensor = ref(createNewEthernetSensor())
 
+//
 // --- Ciclo de Vida y Funciones ---
 onMounted(() => {
   fetchAllMonitors()
@@ -72,10 +70,10 @@ function showNotification(message, type = 'success') {
 
 async function fetchChannels() {
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/channels`)
+    const { data } = await api.get('/channels')
     channels.value = (data || []).map((ch) => ({
       ...ch,
-      config: typeof ch.config === 'string' ? JSON.parse(ch.config) : ch.config,
+      config: typeof ch.config === 'string' ? safeJsonParse(ch.config) : ch.config,
     }))
   } catch (err) {
     console.error('Error al cargar canales:', err)
@@ -83,6 +81,15 @@ async function fetchChannels() {
   }
 }
 
+function safeJsonParse(v, fallback = null) {
+  try {
+    return JSON.parse(v)
+  } catch {
+    return fallback
+  }
+}
+
+//
 // --- Lógica de Creación y Edición de Sensores ---
 function buildSensorPayload(sensorType, sensorData) {
   const finalConfig = { ...sensorData.config }
@@ -122,9 +129,9 @@ async function handleSaveSensor() {
 
     if (isEditMode.value && sensorToEdit.value) {
       // --- Actualización ---
-      const { data } = await axios.put(`${API_BASE_URL}/sensors/${sensorToEdit.value.id}`, payload)
+      const { data } = await api.put(`/sensors/${sensorToEdit.value.id}`, payload)
 
-      // Mezclar para no perder sensor_type ni id (el backend retorna name+config)
+      // Mezclamos para no perder id / sensor_type
       const idx = activeSensors.value.findIndex((s) => s.id === sensorToEdit.value.id)
       if (idx !== -1) {
         activeSensors.value[idx] = {
@@ -132,6 +139,7 @@ async function handleSaveSensor() {
           ...data,
           id: activeSensors.value[idx].id,
           sensor_type: activeSensors.value[idx].sensor_type,
+          config: typeof data.config === 'string' ? safeJsonParse(data.config, {}) : data.config,
         }
       }
 
@@ -147,13 +155,15 @@ async function handleSaveSensor() {
         sensor_type: formToShow.value,
         ...payload,
       }
-      const { data } = await axios.post(`${API_BASE_URL}/sensors`, createPayload)
-      // Añadir al listado local
-      activeSensors.value.push(data)
+      const { data } = await api.post('/sensors', createPayload)
+      activeSensors.value.push({
+        ...data,
+        config: typeof data.config === 'string' ? safeJsonParse(data.config, {}) : data.config,
+      })
       showNotification('Sensor añadido.', 'success')
     }
 
-    // Refrescar desde el backend para asegurar consistencia con DB
+    // Refrescar desde backend por consistencia
     await selectDevice(selectedDevice.value)
     closeForm()
   } catch (err) {
@@ -164,7 +174,8 @@ async function handleSaveSensor() {
   }
 }
 
-// --- Funciones para abrir/cerrar formularios ---
+//
+// --- Abrir / Cerrar formularios ---
 function openFormForCreate(type) {
   isEditMode.value = false
   sensorToEdit.value = null
@@ -177,11 +188,14 @@ function openFormForEdit(sensor) {
   isEditMode.value = true
   sensorToEdit.value = sensor
 
+  // Normalizamos config a objeto por si vino como string
+  const cfg = typeof sensor.config === 'string' ? safeJsonParse(sensor.config, {}) : sensor.config
+
   if (sensor.sensor_type === 'ping') {
     const uiData = createNewPingSensor()
     uiData.name = sensor.name
-    uiData.config = { ...uiData.config, ...sensor.config }
-    ;(sensor.config?.alerts || []).forEach((alert) => {
+    uiData.config = { ...uiData.config, ...cfg }
+    ;(cfg?.alerts || []).forEach((alert) => {
       if (alert.type === 'timeout') uiData.ui_alert_timeout = { enabled: true, ...alert }
       if (alert.type === 'high_latency') uiData.ui_alert_latency = { enabled: true, ...alert }
     })
@@ -189,8 +203,8 @@ function openFormForEdit(sensor) {
   } else if (sensor.sensor_type === 'ethernet') {
     const uiData = createNewEthernetSensor()
     uiData.name = sensor.name
-    uiData.config = { ...uiData.config, ...sensor.config }
-    ;(sensor.config?.alerts || []).forEach((alert) => {
+    uiData.config = { ...uiData.config, ...cfg }
+    ;(cfg?.alerts || []).forEach((alert) => {
       if (alert.type === 'speed_change') uiData.ui_alert_speed_change = { enabled: true, ...alert }
       if (alert.type === 'traffic_threshold') uiData.ui_alert_traffic = { enabled: true, ...alert }
     })
@@ -205,10 +219,11 @@ function closeForm() {
   isEditMode.value = false
 }
 
-// --- Funciones de utilidad ---
+//
+// --- Utilidades ---
 async function fetchAllMonitors() {
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/monitors`)
+    const { data } = await api.get('/monitors')
     allMonitors.value = data
   } catch (err) {
     console.error('Error fetching monitors:', err)
@@ -223,7 +238,12 @@ async function selectDevice(device) {
   const monitor = allMonitors.value.find((m) => m.device_id === device.id)
   if (monitor) {
     currentMonitor.value = monitor
-    activeSensors.value = Array.isArray(monitor.sensors) ? monitor.sensors : []
+    activeSensors.value = Array.isArray(monitor.sensors)
+      ? monitor.sensors.map((s) => ({
+          ...s,
+          config: typeof s.config === 'string' ? safeJsonParse(s.config, {}) : s.config,
+        }))
+      : []
   } else {
     currentMonitor.value = null
     activeSensors.value = []
@@ -240,7 +260,7 @@ function clearSelectedDevice() {
 async function createMonitorCard() {
   if (!selectedDevice.value) return
   try {
-    await axios.post(`${API_BASE_URL}/monitors`, { device_id: selectedDevice.value.id })
+    await api.post('/monitors', { device_id: selectedDevice.value.id })
     showNotification('Tarjeta de monitoreo creada con éxito.', 'success')
     await selectDevice(selectedDevice.value)
   } catch (err) {
@@ -251,7 +271,7 @@ async function createMonitorCard() {
 async function deleteSensor(sensorId) {
   if (!confirm('¿Seguro que quieres eliminar este sensor?')) return
   try {
-    await axios.delete(`${API_BASE_URL}/sensors/${sensorId}`)
+    await api.delete(`/sensors/${sensorId}`)
     activeSensors.value = activeSensors.value.filter((s) => s.id !== sensorId)
     showNotification('Sensor eliminado.', 'success')
   } catch (err) {
@@ -269,9 +289,9 @@ watch(searchQuery, (newQuery) => {
   isLoading.value = true
   searchDebounce = setTimeout(async () => {
     try {
-      const { data } = await axios.get(
-        `${API_BASE_URL}/devices/search?search=${encodeURIComponent(newQuery)}`,
-      )
+      const { data } = await api.get('/devices/search', {
+        params: { search: newQuery },
+      })
       searchResults.value = data
     } catch (err) {
       console.error('Error al buscar dispositivos:', err)
@@ -288,7 +308,7 @@ watch(searchQuery, (newQuery) => {
       {{ notification.message }}
     </div>
     <div class="builder-layout">
-      <!-- Sección 1 y 2 (sin cambios estructurales) -->
+      <!-- Sección 1 y 2 -->
       <section class="builder-step">
         <h2><span class="step-number">1</span> Seleccionar Dispositivo</h2>
         <div v-if="!selectedDevice">
@@ -328,9 +348,9 @@ watch(searchQuery, (newQuery) => {
             <ul v-if="activeSensors.length > 0">
               <li v-for="sensor in activeSensors" :key="sensor.id">
                 <div class="sensor-info">
-                  <span class="sensor-type-badge" :class="sensor.sensor_type">{{
-                    sensor.sensor_type
-                  }}</span>
+                  <span class="sensor-type-badge" :class="sensor.sensor_type">
+                    {{ sensor.sensor_type }}
+                  </span>
                   <strong>{{ sensor.name }}</strong>
                   <span
                     v-if="sensor.config?.alerts && sensor.config.alerts.length > 0"
@@ -361,71 +381,81 @@ watch(searchQuery, (newQuery) => {
     <div v-if="formToShow" class="modal-overlay" @click.self="closeForm">
       <div class="modal-content">
         <h3>{{ isEditMode ? 'Editar' : 'Añadir' }} Sensor {{ formToShow }}</h3>
+
         <!-- FORMULARIO PING -->
         <form v-if="formToShow === 'ping'" @submit.prevent="handleSaveSensor" class="config-form">
           <div class="form-group span-3">
-            <label>Nombre del Sensor</label
-            ><input type="text" v-model="newPingSensor.name" required />
+            <label>Nombre del Sensor</label>
+            <input type="text" v-model="newPingSensor.name" required />
           </div>
+
           <div class="form-group span-2">
-            <label>Tipo de Ping</label
-            ><select v-model="newPingSensor.config.ping_type">
+            <label>Tipo de Ping</label>
+            <select v-model="newPingSensor.config.ping_type">
               <option value="maestro_to_device">Ping al Dispositivo</option>
               <option value="device_to_external">Ping desde Dispositivo</option>
             </select>
           </div>
+
           <div class="form-group" v-if="newPingSensor.config.ping_type === 'device_to_external'">
-            <label>IP de Destino</label
-            ><input type="text" v-model="newPingSensor.config.target_ip" />
+            <label>IP de Destino</label>
+            <input type="text" v-model="newPingSensor.config.target_ip" />
           </div>
+
           <div class="form-group">
-            <label>Intervalo (seg)</label
-            ><input type="number" v-model.number="newPingSensor.config.interval_sec" required />
+            <label>Intervalo (seg)</label>
+            <input type="number" v-model.number="newPingSensor.config.interval_sec" required />
             <p class="form-hint">Frecuencia del chequeo.</p>
           </div>
+
           <div class="form-group">
-            <label>Umbral Latencia Visual (ms)</label
-            ><input
+            <label>Umbral Latencia Visual (ms)</label>
+            <input
               type="number"
               v-model.number="newPingSensor.config.latency_threshold_ms"
               required
             />
             <p class="form-hint">Para estado amarillo en dashboard.</p>
           </div>
+
           <div class="form-group">
-            <label>Modo de Visualización</label
-            ><select v-model="newPingSensor.config.display_mode">
+            <label>Modo de Visualización</label>
+            <select v-model="newPingSensor.config.display_mode">
               <option value="realtime">Tiempo Real</option>
               <option value="average">Promedio</option>
             </select>
             <p class="form-hint">Cómo se muestra en el dashboard.</p>
           </div>
+
           <div class="form-group" v-if="newPingSensor.config.display_mode === 'average'">
-            <label>Nº Pings para Promediar</label
-            ><input type="number" v-model.number="newPingSensor.config.average_count" required />
+            <label>Nº Pings para Promediar</label>
+            <input type="number" v-model.number="newPingSensor.config.average_count" required />
             <p class="form-hint">Suaviza picos de latencia.</p>
           </div>
+
           <div class="sub-section span-3">
             <h4>Configuración de Alertas</h4>
+
             <div class="alert-config-item span-3">
               <div class="form-group checkbox-group">
                 <input
                   type="checkbox"
                   v-model="newPingSensor.ui_alert_timeout.enabled"
                   id="pingTimeout"
-                /><label for="pingTimeout">Activar alerta por Timeout</label>
+                />
+                <label for="pingTimeout">Activar alerta por Timeout</label>
               </div>
               <template v-if="newPingSensor.ui_alert_timeout.enabled">
                 <div class="form-group">
-                  <label>Enviar a Canal</label
-                  ><select v-model="newPingSensor.ui_alert_timeout.channel_id">
+                  <label>Enviar a Canal</label>
+                  <select v-model="newPingSensor.ui_alert_timeout.channel_id">
                     <option :value="null">-- Seleccionar --</option>
                     <option v-for="c in channels" :key="c.id" :value="c.id">{{ c.name }}</option>
                   </select>
                 </div>
                 <div class="form-group">
-                  <label>Enfriamiento (min)</label
-                  ><input
+                  <label>Enfriamiento (min)</label>
+                  <input
                     type="number"
                     v-model.number="newPingSensor.ui_alert_timeout.cooldown_minutes"
                     min="1"
@@ -433,18 +463,20 @@ watch(searchQuery, (newQuery) => {
                 </div>
               </template>
             </div>
+
             <div class="alert-config-item span-3">
               <div class="form-group checkbox-group">
                 <input
                   type="checkbox"
                   v-model="newPingSensor.ui_alert_latency.enabled"
                   id="pingLatency"
-                /><label for="pingLatency">Activar alerta por Latencia Alta</label>
+                />
+                <label for="pingLatency">Activar alerta por Latencia Alta</label>
               </div>
               <template v-if="newPingSensor.ui_alert_latency.enabled">
                 <div class="form-group">
-                  <label>Umbral de Alerta (ms)</label
-                  ><input
+                  <label>Umbral de Alerta (ms)</label>
+                  <input
                     type="number"
                     v-model.number="newPingSensor.ui_alert_latency.threshold_ms"
                     min="1"
@@ -452,15 +484,15 @@ watch(searchQuery, (newQuery) => {
                   <p class="form-hint">Si la latencia supera este valor.</p>
                 </div>
                 <div class="form-group">
-                  <label>Enviar a Canal</label
-                  ><select v-model="newPingSensor.ui_alert_latency.channel_id">
+                  <label>Enviar a Canal</label>
+                  <select v-model="newPingSensor.ui_alert_latency.channel_id">
                     <option :value="null">-- Seleccionar --</option>
                     <option v-for="c in channels" :key="c.id" :value="c.id">{{ c.name }}</option>
                   </select>
                 </div>
                 <div class="form-group">
-                  <label>Enfriamiento (min)</label
-                  ><input
+                  <label>Enfriamiento (min)</label>
+                  <input
                     type="number"
                     v-model.number="newPingSensor.ui_alert_latency.cooldown_minutes"
                     min="1"
@@ -469,11 +501,13 @@ watch(searchQuery, (newQuery) => {
               </template>
             </div>
           </div>
+
           <div class="modal-actions span-3">
             <button type="button" @click="closeForm" class="btn-secondary">Cancelar</button>
             <button type="submit" class="btn-add">Guardar Sensor</button>
           </div>
         </form>
+
         <!-- FORMULARIO ETHERNET -->
         <form
           v-if="formToShow === 'ethernet'"
@@ -481,40 +515,45 @@ watch(searchQuery, (newQuery) => {
           class="config-form"
         >
           <div class="form-group span-2">
-            <label>Nombre del Sensor</label
-            ><input type="text" v-model="newEthernetSensor.name" required />
+            <label>Nombre del Sensor</label>
+            <input type="text" v-model="newEthernetSensor.name" required />
           </div>
+
           <div class="form-group">
-            <label>Nombre de Interfaz</label
-            ><input type="text" v-model="newEthernetSensor.config.interface_name" required />
+            <label>Nombre de Interfaz</label>
+            <input type="text" v-model="newEthernetSensor.config.interface_name" required />
             <p class="form-hint">El nombre exacto en el dispositivo.</p>
           </div>
+
           <div class="form-group">
-            <label>Intervalo (seg)</label
-            ><input type="number" v-model.number="newEthernetSensor.config.interval_sec" required />
+            <label>Intervalo (seg)</label>
+            <input type="number" v-model.number="newEthernetSensor.config.interval_sec" required />
             <p class="form-hint">Frecuencia del chequeo.</p>
           </div>
+
           <div class="sub-section span-3">
             <h4>Configuración de Alertas</h4>
+
             <div class="alert-config-item span-3">
               <div class="form-group checkbox-group">
                 <input
                   type="checkbox"
                   v-model="newEthernetSensor.ui_alert_speed_change.enabled"
                   id="ethSpeed"
-                /><label for="ethSpeed">Activar alerta por Cambio de Velocidad</label>
+                />
+                <label for="ethSpeed">Activar alerta por Cambio de Velocidad</label>
               </div>
               <template v-if="newEthernetSensor.ui_alert_speed_change.enabled">
                 <div class="form-group">
-                  <label>Enviar a Canal</label
-                  ><select v-model="newEthernetSensor.ui_alert_speed_change.channel_id">
+                  <label>Enviar a Canal</label>
+                  <select v-model="newEthernetSensor.ui_alert_speed_change.channel_id">
                     <option :value="null">-- Seleccionar --</option>
                     <option v-for="c in channels" :key="c.id" :value="c.id">{{ c.name }}</option>
                   </select>
                 </div>
                 <div class="form-group">
-                  <label>Enfriamiento (min)</label
-                  ><input
+                  <label>Enfriamiento (min)</label>
+                  <input
                     type="number"
                     v-model.number="newEthernetSensor.ui_alert_speed_change.cooldown_minutes"
                     min="1"
@@ -522,41 +561,43 @@ watch(searchQuery, (newQuery) => {
                 </div>
               </template>
             </div>
+
             <div class="alert-config-item span-3">
               <div class="form-group checkbox-group">
                 <input
                   type="checkbox"
                   v-model="newEthernetSensor.ui_alert_traffic.enabled"
                   id="ethTraffic"
-                /><label for="ethTraffic">Activar alerta por Umbral de Tráfico</label>
+                />
+                <label for="ethTraffic">Activar alerta por Umbral de Tráfico</label>
               </div>
               <template v-if="newEthernetSensor.ui_alert_traffic.enabled">
                 <div class="form-group">
-                  <label>Umbral (Mbps)</label
-                  ><input
+                  <label>Umbral (Mbps)</label>
+                  <input
                     type="number"
                     v-model.number="newEthernetSensor.ui_alert_traffic.threshold_mbps"
                     min="1"
                   />
                 </div>
                 <div class="form-group">
-                  <label>Dirección</label
-                  ><select v-model="newEthernetSensor.ui_alert_traffic.direction">
+                  <label>Dirección</label>
+                  <select v-model="newEthernetSensor.ui_alert_traffic.direction">
                     <option value="any">Subida o Bajada</option>
                     <option value="rx">Solo Bajada</option>
                     <option value="tx">Solo Subida</option>
                   </select>
                 </div>
                 <div class="form-group">
-                  <label>Enviar a Canal</label
-                  ><select v-model="newEthernetSensor.ui_alert_traffic.channel_id">
+                  <label>Enviar a Canal</label>
+                  <select v-model="newEthernetSensor.ui_alert_traffic.channel_id">
                     <option :value="null">-- Seleccionar --</option>
                     <option v-for="c in channels" :key="c.id" :value="c.id">{{ c.name }}</option>
                   </select>
                 </div>
                 <div class="form-group">
-                  <label>Enfriamiento (min)</label
-                  ><input
+                  <label>Enfriamiento (min)</label>
+                  <input
                     type="number"
                     v-model.number="newEthernetSensor.ui_alert_traffic.cooldown_minutes"
                     min="1"
@@ -565,6 +606,7 @@ watch(searchQuery, (newQuery) => {
               </template>
             </div>
           </div>
+
           <div class="modal-actions span-3">
             <button type="button" @click="closeForm" class="btn-secondary">Cancelar</button>
             <button type="submit" class="btn-add">Guardar Sensor</button>

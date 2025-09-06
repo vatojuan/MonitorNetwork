@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import axios from 'axios'
+import api from '@/lib/api' // 👈 usamos el cliente central con Bearer
 
 const savedCredentials = ref([])
 const newCredential = ref({ name: '', username: '', password: '' })
@@ -20,25 +20,26 @@ function showNotification(message, type = 'success') {
 
 async function fetchCredentials() {
   try {
-    const response = await axios.get('http://127.0.0.1:8000/api/credentials')
-    savedCredentials.value = response.data
+    const { data } = await api.get('/credentials')
+    savedCredentials.value = Array.isArray(data) ? data : []
   } catch (err) {
     console.error('Error al cargar credenciales:', err)
-    showNotification('Error al cargar las credenciales.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al cargar las credenciales.', 'error')
   }
 }
 
 async function handleAddCredential() {
-  if (!newCredential.value.name || !newCredential.value.username) {
+  if (!newCredential.value.name.trim() || !newCredential.value.username.trim()) {
     showNotification('Los campos Nombre y Usuario son obligatorios.', 'error')
     return
   }
   try {
-    await axios.post('http://127.0.0.1:8000/api/credentials', newCredential.value)
+    await api.post('/credentials', newCredential.value)
     showNotification(`Credencial '${newCredential.value.name}' añadida.`, 'success')
     newCredential.value = { name: '', username: '', password: '' }
     fetchCredentials()
   } catch (err) {
+    console.error('Error al añadir credencial:', err)
     showNotification(err.response?.data?.detail || 'Error al añadir.', 'error')
   }
 }
@@ -50,10 +51,11 @@ function requestDeleteCredential(credentialId) {
 async function confirmDeleteCredential() {
   if (!credentialToDeleteId.value) return
   try {
-    await axios.delete(`http://127.0.0.1:8000/api/credentials/${credentialToDeleteId.value}`)
+    await api.delete(`/credentials/${credentialToDeleteId.value}`)
     showNotification('Credencial eliminada.', 'success')
     fetchCredentials()
   } catch (err) {
+    console.error('Error al eliminar credencial:', err)
     showNotification(err.response?.data?.detail || 'Error al eliminar.', 'error')
   } finally {
     credentialToDeleteId.value = null
@@ -66,6 +68,7 @@ async function confirmDeleteCredential() {
     <div v-if="notification.show" :class="['notification', notification.type]">
       {{ notification.message }}
     </div>
+
     <div v-if="credentialToDeleteId" class="modal-overlay">
       <div class="modal-content">
         <h3>Confirmar Eliminación</h3>
@@ -95,6 +98,7 @@ async function confirmDeleteCredential() {
           <button type="submit">Añadir Credencial</button>
         </form>
       </section>
+
       <section class="control-section">
         <h2><i class="icon">📋</i> Credenciales Guardadas</h2>
         <ul v-if="savedCredentials.length > 0" class="credentials-list">

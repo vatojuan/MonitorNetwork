@@ -1,12 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import axios from 'axios'
-
-// Base de API dinámica (usa el mismo host del front)
-const API_PROTO = window.location.protocol // 'http:' | 'https:'
-const API_HOST = window.location.hostname // 'localhost' | '127.0.0.1' | dominio
-const API_PORT = 8000
-const API_BASE_URL = `${API_PROTO}//${API_HOST}:${API_PORT}/api`
+import api from '@/lib/api' // ⬅️ Axios preconfigurado con baseURL y Bearer
 
 const notification = ref({ show: false, message: '', type: 'success' })
 function showNotification(message, type = 'success') {
@@ -31,8 +25,7 @@ onMounted(() => {
 async function fetchVpnProfiles() {
   isLoading.value = true
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/vpns`)
-    // Normalizamos is_default (el backend acepta true/1 indistinto)
+    const { data } = await api.get('/vpns') // ⬅️ SIN /api
     vpnProfiles.value = (data || []).map((p) => ({
       ...p,
       is_default: !!p.is_default,
@@ -40,7 +33,7 @@ async function fetchVpnProfiles() {
     }))
   } catch (err) {
     console.error('Error al cargar perfiles VPN:', err)
-    showNotification('Error al cargar perfiles VPN.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al cargar perfiles VPN.', 'error')
   } finally {
     isLoading.value = false
   }
@@ -57,7 +50,7 @@ async function createProfile() {
       config_data: newProfile.value.config_data,
       check_ip: newProfile.value.check_ip.trim(),
     }
-    const { data } = await axios.post(`${API_BASE_URL}/vpns`, body)
+    const { data } = await api.post('/vpns', body) // ⬅️ SIN /api
     vpnProfiles.value.push({ ...data, is_default: !!data.is_default, _expanded: false })
     newProfile.value = { name: '', check_ip: '', config_data: '' }
     showNotification('Perfil VPN creado.', 'success')
@@ -73,9 +66,9 @@ async function saveProfile(profile) {
       name: profile.name,
       check_ip: profile.check_ip,
       config_data: profile.config_data,
-      // is_default no se toca acá (va por acción específica setDefault)
+      // is_default se maneja aparte con setDefault
     }
-    await axios.put(`${API_BASE_URL}/vpns/${profile.id}`, payload)
+    await api.put(`/vpns/${profile.id}`, payload) // ⬅️ SIN /api
     showNotification('Perfil actualizado.', 'success')
     await fetchVpnProfiles()
   } catch (err) {
@@ -86,8 +79,7 @@ async function saveProfile(profile) {
 
 async function setDefault(profile) {
   try {
-    await axios.put(`${API_BASE_URL}/vpns/${profile.id}`, { is_default: true })
-    // El backend desmarca a los demás. Refrescamos listado.
+    await api.put(`/vpns/${profile.id}`, { is_default: true }) // ⬅️ SIN /api
     await fetchVpnProfiles()
     showNotification(`"${profile.name}" ahora es el default.`, 'success')
   } catch (err) {
@@ -103,7 +95,7 @@ async function testProfile(profile) {
   }
   try {
     const payload = { ip_address: profile.check_ip.trim(), vpn_profile_id: profile.id }
-    const { data } = await axios.post(`${API_BASE_URL}/devices/test_reachability`, payload)
+    const { data } = await api.post('/devices/test_reachability', payload) // ⬅️ SIN /api
     if (data.reachable) {
       showNotification(`Túnel OK. Alcanzable (${profile.check_ip}).`, 'success')
     } else {
@@ -118,7 +110,7 @@ async function testProfile(profile) {
 async function deleteProfile(profile) {
   if (!confirm(`¿Eliminar el perfil "${profile.name}"?`)) return
   try {
-    await axios.delete(`${API_BASE_URL}/vpns/${profile.id}`)
+    await api.delete(`/vpns/${profile.id}`) // ⬅️ SIN /api
     vpnProfiles.value = vpnProfiles.value.filter((p) => p.id !== profile.id)
     showNotification('Perfil eliminado.', 'success')
   } catch (err) {
@@ -155,8 +147,7 @@ async function deleteProfile(profile) {
           rows="10"
           spellcheck="false"
           placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = ...&#10;DNS = ...&#10;&#10;[Peer]&#10;PublicKey = ...&#10;AllowedIPs = ...&#10;Endpoint = ..."
-        >
-        </textarea>
+        />
       </div>
 
       <div class="actions-row">

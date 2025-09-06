@@ -1,52 +1,62 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
-import axios from 'axios'
+import { useRouter } from 'vue-router'
+import api from '@/lib/api' // ⬅️ Axios preconfigurado con Bearer
+import { supabase } from '@/lib/supabase'
 
-const API_BASE_URL = 'http://127.0.0.1:8000/api'
+const router = useRouter()
 
+// ===== UI Estado general =====
 const currentTab = ref('add')
 const notification = ref({ show: false, message: '', type: 'success' })
+function showNotification(message, type = 'success') {
+  notification.value = { show: true, message, type }
+  setTimeout(() => (notification.value.show = false), 4000)
+}
 
-// -------- Estado “Alta en un paso” --------
+// ===== Usuario (mostrar email y logout) =====
+const userEmail = ref('')
+async function loadUser() {
+  const { data } = await supabase.auth.getUser()
+  userEmail.value = data.user?.email || ''
+}
+async function logout() {
+  await supabase.auth.signOut()
+  showNotification('Sesión cerrada.', 'success')
+  router.push('/login')
+}
+
+// ===== Estado “Alta en un paso” =====
 const addForm = ref({
   client_name: '',
   ip_address: '',
   mac_address: '',
   node: '',
   connection_method: 'vpn', // 'vpn' | 'direct' | 'maestro'
-  vpn_profile_id: null, // requerido si connection_method = 'vpn'
-  maestro_id: null, // requerido si connection_method = 'maestro'
+  vpn_profile_id: null, // si connection_method = 'vpn'
+  maestro_id: null, // si connection_method = 'maestro'
 })
 
 const isSubmitting = ref(false)
 const isTesting = ref(false)
 const testResult = ref(null)
 
-// -------- Listados y soporte --------
+// ===== Listados y soporte =====
 const allDevices = ref([])
 const vpnProfiles = ref([])
 const isLoadingDevices = ref(false)
+const deletingId = ref(null) // id del dispositivo que se está borrando
 
 const maestros = computed(() => allDevices.value.filter((d) => d.is_maestro))
-
-onMounted(() => {
-  fetchAllDevices()
-  fetchVpnProfiles()
-})
-
-function showNotification(message, type = 'success') {
-  notification.value = { show: true, message, type }
-  setTimeout(() => (notification.value.show = false), 4000)
-}
 
 async function fetchAllDevices() {
   isLoadingDevices.value = true
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/devices`)
-    allDevices.value = data
+    const { data } = await api.get('/devices') // ⬅️ sin /api
+    allDevices.value = Array.isArray(data) ? data : []
   } catch (err) {
     console.error('Error al cargar dispositivos:', err)
-    showNotification('Error al cargar dispositivos.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al cargar dispositivos.', 'error')
   } finally {
     isLoadingDevices.value = false
   }
@@ -54,22 +64,22 @@ async function fetchAllDevices() {
 
 async function fetchVpnProfiles() {
   try {
-    const { data } = await axios.get(`${API_BASE_URL}/vpns`)
-    vpnProfiles.value = data
+    const { data } = await api.get('/vpns') // ⬅️ sin /api
+    vpnProfiles.value = Array.isArray(data) ? data : []
   } catch (err) {
     console.error('Error al cargar perfiles VPN:', err)
-    showNotification('Error al cargar perfiles VPN.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al cargar perfiles VPN.', 'error')
   }
 }
 
 /**
  * Alta en UN paso:
- *  - Si elegís VPN: el backend levanta túnel, valida credencial y crea el dispositivo.
+ *  - VPN: backend levanta túnel, valida credencial y crea el dispositivo.
  *  - Directo: conecta contra la IP y crea.
- *  - Maestro: (queda reservado si más adelante agregamos flujo maestro->device).
+ *  - Maestro: a través de un Maestro existente.
  */
 async function handleAddDeviceOneStep() {
-  // Validaciones mínimas de front
+  // Validaciones mínimas
   if (!addForm.value.client_name?.trim() || !addForm.value.ip_address?.trim()) {
     showNotification('Completá Cliente e IP.', 'error')
     return
@@ -83,7 +93,6 @@ async function handleAddDeviceOneStep() {
     return
   }
 
-  // Armar payload tal como lo espera /api/devices/manual
   const payload = {
     client_name: addForm.value.client_name,
     ip_address: addForm.value.ip_address,
@@ -95,7 +104,7 @@ async function handleAddDeviceOneStep() {
 
   isSubmitting.value = true
   try {
-    const { data } = await axios.post(`${API_BASE_URL}/devices/manual`, payload)
+    const { data } = await api.post('/devices/manual', payload) // ⬅️ sin /api
     showNotification(`Dispositivo "${data.client_name}" creado.`, 'success')
     resetAddForm()
     fetchAllDevices()
@@ -108,10 +117,7 @@ async function handleAddDeviceOneStep() {
   }
 }
 
-/**
- * (Opcional) Probar conexión antes de crear (usa /api/devices/test_reachability).
- * Sirve para diagnosticar si la VPN/credencial responde, pero no es requerido.
- */
+/** Probar conexión antes de crear (opcional) */
 async function handleTestReachability() {
   if (!addForm.value.ip_address?.trim()) {
     showNotification('Ingresá la IP a probar.', 'error')
@@ -127,7 +133,7 @@ async function handleTestReachability() {
   isTesting.value = true
   testResult.value = null
   try {
-    const { data } = await axios.post(`${API_BASE_URL}/devices/test_reachability`, payload)
+    const { data } = await api.post('/devices/test_reachability', payload) // ⬅️ sin /api
     testResult.value = data
     if (data.reachable) {
       showNotification('¡Conexión OK! Podés crear el dispositivo.', 'success')
@@ -160,7 +166,7 @@ function resetAddForm() {
 async function promoteToMaestro(device) {
   if (!confirm(`¿Promover a "${device.client_name}" como Maestro?`)) return
   try {
-    await axios.put(`${API_BASE_URL}/devices/${device.id}/promote`)
+    await api.put(`/devices/${device.id}/promote`) // ⬅️ sin /api
     showNotification(`${device.client_name} ahora es Maestro.`, 'success')
     fetchAllDevices()
   } catch (err) {
@@ -172,19 +178,54 @@ async function promoteToMaestro(device) {
 async function handleVpnAssociation(device) {
   const vpnId = device.vpn_profile_id === '' ? null : device.vpn_profile_id
   try {
-    await axios.put(`${API_BASE_URL}/devices/${device.id}/associate_vpn`, { vpn_profile_id: vpnId })
+    await api.put(`/devices/${device.id}/associate_vpn`, { vpn_profile_id: vpnId }) // ⬅️
     showNotification('Asociación de VPN actualizada.', 'success')
+    await fetchAllDevices()
   } catch (err) {
     console.error('Error al asociar VPN:', err)
-    showNotification('Error al asociar la VPN.', 'error')
+    showNotification(err.response?.data?.detail || 'Error al asociar la VPN.', 'error')
     fetchAllDevices()
   }
 }
+
+/* ------------------- Eliminar dispositivo ------------------- */
+async function deleteDevice(device) {
+  const extra = device.is_maestro
+    ? '\n\nATENCIÓN: este dispositivo es Maestro. Los equipos que dependan de él podrían necesitar reconfigurarse.'
+    : ''
+  if (!confirm(`¿Eliminar "${device.client_name}" (${device.ip_address})?${extra}`)) return
+
+  try {
+    deletingId.value = device.id
+    await api.delete(`/devices/${device.id}`) // ⬅️ sin /api
+    showNotification('Dispositivo eliminado.', 'success')
+    await fetchAllDevices()
+  } catch (err) {
+    console.error('[DELETE device]', err)
+    showNotification(err.response?.data?.detail || 'No se pudo eliminar el dispositivo.', 'error')
+  } finally {
+    deletingId.value = null
+  }
+}
+
+// ===== Lifecycle =====
+onMounted(async () => {
+  await loadUser()
+  // Si el guard te trajo aquí, ya hay sesión y el cliente api pondrá el Bearer.
+  fetchAllDevices()
+  fetchVpnProfiles()
+})
 </script>
 
 <template>
   <div class="page-wrap">
-    <h1>Dispositivos</h1>
+    <header class="topbar">
+      <h1>Dispositivos</h1>
+      <div class="auth-box">
+        <span v-if="userEmail" class="user-pill">{{ userEmail }}</span>
+        <button class="btn-secondary" @click="logout">Cerrar sesión</button>
+      </div>
+    </header>
 
     <div class="tabs">
       <button :class="{ active: currentTab === 'add' }" @click="currentTab = 'add'">Agregar</button>
@@ -308,6 +349,16 @@ async function handleVpnAssociation(device) {
             <button v-else @click="promoteToMaestro(device)" class="btn-promote">
               Promover a Maestro
             </button>
+
+            <!-- Eliminar -->
+            <button
+              class="btn-danger"
+              :disabled="deletingId === device.id"
+              @click="deleteDevice(device)"
+              title="Eliminar dispositivo"
+            >
+              {{ deletingId === device.id ? 'Eliminando...' : 'Eliminar' }}
+            </button>
           </div>
         </li>
       </ul>
@@ -334,8 +385,26 @@ async function handleVpnAssociation(device) {
 .page-wrap {
   color: var(--font-color);
 }
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+.auth-box {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.user-pill {
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid #2a2a2a;
+  font-size: 0.9rem;
+}
+
 h1 {
-  margin: 0 0 1rem 0;
+  margin: 0;
 }
 h2 {
   display: flex;
@@ -375,7 +444,6 @@ h2 {
   flex-direction: column;
   gap: 1rem;
 }
-
 .grid-2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -400,10 +468,12 @@ select {
 .actions-row {
   display: flex;
   gap: 0.5rem;
+  flex-wrap: wrap;
 }
 .btn-primary,
 .btn-secondary,
-.btn-promote {
+.btn-promote,
+.btn-danger {
   border-radius: 8px;
   padding: 0.6rem 0.9rem;
   cursor: pointer;
@@ -421,6 +491,10 @@ select {
 .btn-promote {
   background: var(--primary-color);
   color: #0b1220;
+}
+.btn-danger {
+  background: var(--error-red);
+  color: #fff;
 }
 
 .test-box {
@@ -451,6 +525,7 @@ select {
   background: var(--bg-color);
   border-radius: 8px;
   padding: 1rem;
+  gap: 1rem;
 }
 .device-info {
   display: flex;
@@ -460,7 +535,8 @@ select {
 .actions {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 0.5rem;
+  flex-wrap: wrap;
 }
 .maestro-actions {
   display: flex;

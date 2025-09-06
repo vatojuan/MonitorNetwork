@@ -1,7 +1,7 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import axios from 'axios'
+import api from '@/lib/api'
 import { Line } from 'vue-chartjs'
 import {
   Chart as ChartJS,
@@ -13,12 +13,13 @@ import {
   LinearScale,
   PointElement,
   TimeScale,
+  Filler,
 } from 'chart.js'
 import 'chartjs-adapter-date-fns'
 import { es } from 'date-fns/locale'
 import zoomPlugin from 'chartjs-plugin-zoom'
+import { addWsListener, connectWebSocketWhenAuthenticated, getCurrentWebSocket } from '@/lib/ws'
 
-// Registrar componentes/escala/plugins de Chart.js (incluye zoom)
 ChartJS.register(
   Title,
   Tooltip,
@@ -28,195 +29,109 @@ ChartJS.register(
   LinearScale,
   PointElement,
   TimeScale,
+  Filler,
   zoomPlugin,
 )
 
-// ---------- Endpoints dinámicos ----------
-const API_PROTO = window.location.protocol
-const HOST = window.location.hostname
-const API_BASE_URL = `${API_PROTO}//${HOST}:8000/api`
-const WS_PROTO = API_PROTO === 'https:' ? 'wss' : 'ws'
-const WS_URL = `${WS_PROTO}://${HOST}:8000/ws`
-
-// ---------- Router / estado base ----------
 const route = useRoute()
 const router = useRouter()
-const chartRef = ref(null)
-
 const sensorId = Number(route.params.id)
+
+const chartRef = ref(null)
 const sensorInfo = ref(null)
 const historyData = ref([])
-const knownTimestamps = ref(new Set())
 const isLoading = ref(true)
 const isZoomed = ref(false)
 const timeRange = ref('24h')
-const isLiveView = ref(true) // si estamos pegados al presente
+// CAMBIO: La variable isLiveView ya no es necesaria, la hemos eliminado.
 
 const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
-// ---------- WebSocket ----------
-let socket = null
+const hoursMap = { '1h': 1, '12h': 12, '24h': 24, '7d': 168, '30d': 720 }
+const timeRanges = hoursMap
 
-function connectWebSocket() {
-  try {
-    socket = new WebSocket(WS_URL)
-
-    socket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        if (Number(data.sensor_id) !== sensorId) return
-
-        // Si estamos en vista "en vivo", agregamos el punto nuevo.
-        if (isLiveView.value) {
-          const key = new Date(data.timestamp).toISOString()
-          if (!knownTimestamps.value.has(key)) {
-            knownTimestamps.value.add(key)
-            historyData.value.push(data)
-
-            // Asegurar orden temporal si viniera fuera de orden
-            const len = historyData.value.length
-            if (len > 1) {
-              const last = new Date(historyData.value[len - 1].timestamp)
-              const prev = new Date(historyData.value[len - 2].timestamp)
-              if (last < prev) {
-                historyData.value.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-              }
-            }
-          }
-        }
-      } catch (err) {
-        // Evitamos no-empty y registramos en dev
-        if (import.meta.env?.DEV) console.debug('WS parse error:', err)
-      }
-    }
-
-    socket.onerror = (err) => {
-      if (import.meta.env?.DEV) console.debug('WebSocket error:', err)
-    }
-
-    socket.onclose = () => {
-      // Reintento simple
-      setTimeout(connectWebSocket, 3000)
-    }
-  } catch (err) {
-    if (import.meta.env?.DEV) console.debug('No se pudo abrir WebSocket:', err)
-  }
-}
-
-// ---------- Helpers ----------
+// --- Helpers de formato ---
 function formatBitrateForChart(bits) {
   const n = Number(bits)
-  if (!Number.isFinite(n) || n < 0) return 0
-  return Number((n / 1_000_000).toFixed(2)) // Mbps
+  return !Number.isFinite(n) || n < 0 ? 0 : Number((n / 1_000_000).toFixed(2))
 }
 
-const timeRanges = { '1h': 1, '12h': 12, '24h': 24, '7d': 168, '30d': 720 }
+function pickTimestamp(obj) {
+  if (!obj) return null
+  const v = obj.timestamp || obj.ts || obj.time
+  if (v) {
+    const d = new Date(v)
+    if (!isNaN(d.valueOf())) return d
+  }
+  return new Date()
+}
 
-// ---------- Carga inicial de historial y sensor ----------
+// --- Lógica de datos ---
 async function fetchHistory() {
   isLoading.value = true
   try {
-    // El back calcula start/end en UTC según time_range
-    const { data } = await axios.get(`${API_BASE_URL}/sensors/${sensorId}/history_range`, {
+    const { data } = await api.get(`/sensors/${sensorId}/history_range`, {
       params: { time_range: timeRange.value },
     })
-    const arr = Array.isArray(data) ? data : []
-    arr.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-    historyData.value = arr
-    knownTimestamps.value = new Set(arr.map((d) => new Date(d.timestamp).toISOString()))
+    historyData.value = Array.isArray(data) ? data : []
   } catch (err) {
-    if (import.meta.env?.DEV) console.debug('Error fetching history:', err)
+    console.error('Error fetching history:', err)
     historyData.value = []
-    knownTimestamps.value = new Set()
   } finally {
     isLoading.value = false
   }
 }
 
-async function fetchSensorInfo() {
-  try {
-    const { data } = await axios.get(`${API_BASE_URL}/sensors/${sensorId}/details`)
-    sensorInfo.value = data
-  } catch (err) {
-    if (import.meta.env?.DEV) console.debug('Error fetching sensor info:', err)
-    router.push('/')
+// --- Lógica de WebSocket ---
+function onBusMessage(payload) {
+  const updates = Array.isArray(payload) ? payload : [payload]
+  const relevantUpdates = updates.filter((u) => u && Number(u.sensor_id) === sensorId)
+
+  if (relevantUpdates.length === 0) {
+    return
   }
-}
 
-// ---------- Rango / zoom ----------
-function setRange(range) {
-  timeRange.value = range
-  isLiveView.value = true
-  isZoomed.value = false
-  const chart = chartRef.value?.chart
-  if (chart?.resetZoom) chart.resetZoom()
-  fetchHistory()
-}
+  // CAMBIO: Se eliminó el chequeo de "isLiveView". El gráfico ahora SIEMPRE se actualiza.
 
-function resetZoom() {
-  const chart = chartRef.value?.chart
-  if (chart?.resetZoom) {
-    chart.resetZoom()
-    isZoomed.value = false
-    isLiveView.value = true
-  }
-}
+  const dataMap = new Map()
 
-// ---------- Eventos de enlace (ethernet) ----------
-const linkStatusEvents = computed(() => {
-  if (sensorInfo.value?.sensor_type !== 'ethernet' || historyData.value.length === 0) return []
-  const events = []
-  let lastStatus = null
-  let lastSpeed = null
-
-  historyData.value.forEach((d) => {
-    if (d.status !== lastStatus || d.speed !== lastSpeed) {
-      const tsLocal = new Date(d.timestamp)
-      events.push({
-        timestamp: new Intl.DateTimeFormat('es-AR', {
-          dateStyle: 'medium',
-          timeStyle: 'medium',
-        }).format(tsLocal),
-        status: d.status,
-        speed: d.speed,
-      })
-      lastStatus = d.status
-      lastSpeed = d.speed
-    }
+  historyData.value.forEach((point) => {
+    const ts = new Date(point.timestamp).toISOString()
+    dataMap.set(ts, point)
   })
-  return events.reverse()
-})
 
-// ---------- Chart config ----------
-const timeUnit = computed(() => {
-  switch (timeRange.value) {
-    case '1h':
-      return 'minute'
-    case '12h':
-    case '24h':
-      return 'hour'
-    case '7d':
-    case '30d':
-      return 'day'
-    default:
-      return 'hour'
-  }
-})
+  relevantUpdates.forEach((point) => {
+    const ts = pickTimestamp(point).toISOString()
+    dataMap.set(ts, { ...point, timestamp: ts })
+  })
 
+  const newHistory = Array.from(dataMap.values())
+  newHistory.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+
+  const nowMs = Date.now()
+  const hours = hoursMap[timeRange.value] ?? 24
+  const cutoff = nowMs - hours * 3600 * 1000
+
+  historyData.value = newHistory.filter((p) => new Date(p.timestamp).getTime() >= cutoff)
+}
+
+// --- Configuración del Gráfico ---
 const chartData = computed(() => {
   if (!sensorInfo.value) return { datasets: [] }
 
-  // Alimentamos {x, y} en milisegundos locales
-  if (sensorInfo.value.sensor_type === 'ping') {
+  const dataPoints = historyData.value
+  const type = sensorInfo.value.sensor_type
+
+  if (type === 'ping') {
     return {
       datasets: [
         {
           label: 'Latencia (ms)',
           backgroundColor: '#5372f0',
           borderColor: '#5372f0',
-          data: historyData.value.map((d) => ({
+          data: dataPoints.map((d) => ({
             x: new Date(d.timestamp).valueOf(),
-            y: Number(d.latency_ms || 0),
+            y: Number(d.latency_ms ?? 0),
           })),
           tension: 0.2,
           pointRadius: 2,
@@ -225,14 +140,14 @@ const chartData = computed(() => {
     }
   }
 
-  if (sensorInfo.value.sensor_type === 'ethernet') {
+  if (type === 'ethernet') {
     return {
       datasets: [
         {
           label: 'Descarga (Mbps)',
           backgroundColor: 'rgba(54, 162, 235, 0.5)',
           borderColor: 'rgba(54, 162, 235, 1)',
-          data: historyData.value.map((d) => ({
+          data: dataPoints.map((d) => ({
             x: new Date(d.timestamp).valueOf(),
             y: formatBitrateForChart(d.rx_bitrate),
           })),
@@ -244,7 +159,7 @@ const chartData = computed(() => {
           label: 'Subida (Mbps)',
           backgroundColor: 'rgba(75, 192, 192, 0.5)',
           borderColor: 'rgba(75, 192, 192, 1)',
-          data: historyData.value.map((d) => ({
+          data: dataPoints.map((d) => ({
             x: new Date(d.timestamp).valueOf(),
             y: formatBitrateForChart(d.tx_bitrate),
           })),
@@ -259,91 +174,100 @@ const chartData = computed(() => {
   return { datasets: [] }
 })
 
-const chartOptions = computed(() => {
-  const isEthernet = sensorInfo.value?.sensor_type === 'ethernet'
-  return {
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: false,
-    parsing: false, // usamos {x,y}
-    scales: {
-      x: {
-        type: 'time',
-        adapters: { date: { locale: es } },
-        time: {
-          unit: timeUnit.value,
-          tooltipFormat: 'dd MMM, HH:mm:ss',
-          displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'dd MMM' },
-        },
-        ticks: { color: '#8d8d8d' },
-        grid: { color: 'rgba(255, 255, 255, 0.1)' },
-      },
-      y: {
-        beginAtZero: true,
-        ticks: {
-          color: '#8d8d8d',
-          callback: (value) => (isEthernet ? `${value} Mbps` : value),
-        },
-        grid: { color: 'rgba(255, 255, 255, 0.1)' },
+const chartOptions = computed(() => ({
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: { duration: 0 },
+  scales: {
+    x: {
+      type: 'time',
+      adapters: { date: { locale: es } },
+      time: {
+        unit: timeRange.value === '1h' ? 'minute' : 'hour',
+        tooltipFormat: 'dd MMM, HH:mm:ss',
+        displayFormats: { minute: 'HH:mm', hour: 'HH:mm' },
       },
     },
-    plugins: {
-      legend: { display: isEthernet, labels: { color: '#e0e0e0' } },
-      tooltip: {
-        callbacks: {
-          label: (ctx) => {
-            let label = ctx.dataset.label ? `${ctx.dataset.label}: ` : ''
-            if (ctx.parsed.y != null) {
-              label += isEthernet ? `${ctx.parsed.y} Mbps` : `${ctx.parsed.y} ms`
-            }
-            return label
-          },
-        },
-      },
+    y: { beginAtZero: true },
+  },
+  plugins: {
+    legend: { display: sensorInfo.value?.sensor_type === 'ethernet' },
+    zoom: {
+      // CAMBIO: Se eliminaron los "onPanStart" y "onZoomStart" que desactivaban el live view.
+      pan: { enabled: true, mode: 'x' },
       zoom: {
-        // Pan con mouse presionado
-        pan: {
-          enabled: true,
-          mode: 'x',
-          onPanStart: () => {
-            isLiveView.value = false
-          },
-        },
-        // Zoom con rueda o pinza
-        zoom: {
-          wheel: { enabled: true },
-          pinch: { enabled: true },
-          mode: 'x',
-          onZoomStart: () => {
-            isLiveView.value = false
-          },
-          onZoomComplete: () => {
-            isZoomed.value = true
-          },
+        wheel: { enabled: true },
+        mode: 'x',
+        onZoomComplete: () => {
+          isZoomed.value = true
         },
       },
     },
-    interaction: {
-      mode: 'nearest',
-      intersect: false,
-    },
-  }
-})
+  },
+  interaction: { mode: 'nearest', intersect: false },
+}))
 
-// ---------- Efectos ----------
-onMounted(() => {
-  fetchSensorInfo()
+// --- Acciones de UI ---
+function setRange(range) {
+  timeRange.value = range
+  isZoomed.value = false
+  chartRef.value?.chart.resetZoom()
   fetchHistory()
-  connectWebSocket()
+}
+function resetZoom() {
+  chartRef.value?.chart.resetZoom()
+  isZoomed.value = false
+}
+
+// --- Ciclo de Vida del Componente ---
+let offBus = null
+
+onMounted(async () => {
+  try {
+    const { data } = await api.get(`/sensors/${sensorId}/details`)
+    sensorInfo.value = data
+    await fetchHistory()
+  } catch (err) {
+    console.error('Error loading sensor details:', err)
+    router.push('/')
+    return
+  }
+
+  await connectWebSocketWhenAuthenticated()
+  offBus = addWsListener(onBusMessage)
+
+  const ws = getCurrentWebSocket()
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'subscribe_sensors', sensor_ids: [sensorId] }))
+  }
 })
 
 onUnmounted(() => {
-  try {
-    socket?.close()
-  } catch (err) {
-    // evita regla no-empty y no-unused-vars
-    void err
-  }
+  if (offBus) offBus()
+})
+
+watch(timeRange, () => fetchHistory())
+
+const linkStatusEvents = computed(() => {
+  if (sensorInfo.value?.sensor_type !== 'ethernet' || historyData.value.length === 0) return []
+  const events = []
+  let lastStatus = null
+  let lastSpeed = null
+  historyData.value.forEach((d) => {
+    if (d.status !== lastStatus || d.speed !== lastSpeed) {
+      events.push({
+        timestamp: new Intl.DateTimeFormat('es-AR', {
+          dateStyle: 'medium',
+          timeStyle: 'medium',
+        }).format(new Date(d.timestamp)),
+        status: d.status,
+        speed: d.speed,
+      })
+      lastStatus = d.status
+      lastSpeed = d.speed
+    }
+  })
+  return events.reverse()
 })
 </script>
 
@@ -460,8 +384,7 @@ onUnmounted(() => {
   background-color: var(--surface-color);
   border-radius: 12px;
 }
-.range-selector,
-.navigation {
+.range-selector {
   display: flex;
   gap: 0.5rem;
 }
